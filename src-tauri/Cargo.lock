@@ -4074,6 +4074,7 @@ name = "tauri-app"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "glob",
  "hex",
  "hmac",
  "reqwest 0.12.28",

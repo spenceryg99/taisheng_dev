@@ -1,5 +1,9 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env;
+use std::fs;
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -94,6 +98,26 @@ struct TargetSyncResult {
     message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshShortcutRow {
+    alias: String,
+    host_name: Option<String>,
+    port: Option<String>,
+    user: Option<String>,
+    identity_file: Option<String>,
+    proxy_jump: Option<String>,
+    source_file: Option<String>,
+    source_line: Option<usize>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SshAliasSource {
+    source_file: String,
+    source_line: usize,
+}
+
 #[derive(Debug, Clone)]
 struct SecurityRule {
     rule_id: Option<String>,
@@ -109,7 +133,11 @@ struct ApiError {
 }
 
 impl ApiError {
-    fn new(code: impl Into<String>, message: impl Into<String>, request_id: Option<String>) -> Self {
+    fn new(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        request_id: Option<String>,
+    ) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -121,7 +149,11 @@ impl ApiError {
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(request_id) = &self.request_id {
-            write!(f, "{}: {} (RequestId: {})", self.code, self.message, request_id)
+            write!(
+                f,
+                "{}: {} (RequestId: {})",
+                self.code, self.message, request_id
+            )
         } else {
             write!(f, "{}: {}", self.code, self.message)
         }
@@ -175,11 +207,7 @@ impl AlibabaOpenApiClient {
             signed_headers.insert("x-acs-security-token".to_string(), token.to_string());
         }
 
-        let signed_header_names = signed_headers
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(";");
+        let signed_header_names = signed_headers.keys().cloned().collect::<Vec<_>>().join(";");
         let canonical_headers = signed_headers
             .iter()
             .map(|(key, value)| format!("{}:{}", key, canonicalize_header_value(value)))
@@ -190,7 +218,10 @@ impl AlibabaOpenApiClient {
             "POST\n/\n\n{}\n\n{}\n{}",
             canonical_headers, signed_header_names, payload_hash
         );
-        let string_to_sign = format!("ACS3-HMAC-SHA256\n{}", sha256_hex(canonical_request.as_bytes()));
+        let string_to_sign = format!(
+            "ACS3-HMAC-SHA256\n{}",
+            sha256_hex(canonical_request.as_bytes())
+        );
         let signature = hmac_sha256_hex(&credential.access_key_secret, &string_to_sign)?;
 
         let authorization = format!(
@@ -405,6 +436,48 @@ async fn sync_all(request: SyncRequest) -> Result<SyncResponse, String> {
     })
 }
 
+#[tauri::command]
+fn list_ssh_shortcuts() -> Result<Vec<SshShortcutRow>, String> {
+    let home_dir = home_dir_path()?;
+    let config_path = home_dir.join(".ssh").join("config");
+    if !config_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut visited_files: HashSet<PathBuf> = HashSet::new();
+    let mut aliases: BTreeMap<String, SshAliasSource> = BTreeMap::new();
+    collect_ssh_aliases_from_file(&config_path, &home_dir, &mut visited_files, &mut aliases)?;
+
+    let rows = aliases
+        .into_iter()
+        .map(|(alias, source)| resolve_ssh_shortcut_row(alias, source))
+        .collect::<Vec<_>>();
+    Ok(rows)
+}
+
+#[tauri::command]
+fn open_ssh_terminal(alias: String) -> Result<(), String> {
+    let alias = validate_alias(&alias)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        return open_ssh_terminal_macos(alias);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return open_ssh_terminal_windows(alias);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return open_ssh_terminal_linux(alias);
+    }
+
+    #[allow(unreachable_code)]
+    Err("当前系统暂不支持一键打开 SSH 终端".to_string())
+}
+
 async fn sync_single_target(
     client: &AlibabaOpenApiClient,
     account: &AccountInput,
@@ -412,7 +485,8 @@ async fn sync_single_target(
     cidr: &str,
 ) -> Result<TargetSyncResult, ApiError> {
     let region_id = resolve_target_region(client, account, target).await?;
-    let ingress_rules = describe_ingress_rules(client, account, &region_id, &target.security_group_id).await?;
+    let ingress_rules =
+        describe_ingress_rules(client, account, &region_id, &target.security_group_id).await?;
 
     if let Some(rule_id) = trim_to_option(&target.rule_id) {
         if let Some(rule) = ingress_rules
@@ -554,7 +628,10 @@ async fn update_existing_rule(
 
     let mut params = BTreeMap::new();
     params.insert("RegionId".to_string(), region_id.to_string());
-    params.insert("SecurityGroupId".to_string(), target.security_group_id.clone());
+    params.insert(
+        "SecurityGroupId".to_string(),
+        target.security_group_id.clone(),
+    );
     params.insert("SecurityGroupRuleId".to_string(), rule_id.clone());
     params.insert("SourceCidrIp".to_string(), cidr.to_string());
 
@@ -598,7 +675,9 @@ async fn resolve_target_region(
     }
 
     if let Some(region_id) = trim_to_option(&account.default_region_id) {
-        if security_group_exists_in_region(client, account, region_id, &target.security_group_id).await? {
+        if security_group_exists_in_region(client, account, region_id, &target.security_group_id)
+            .await?
+        {
             return Ok(region_id.to_string());
         }
     }
@@ -693,13 +772,8 @@ async fn describe_regions(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| {
-        ApiError::new(
-            "DescribeRegionsFailed",
-            "无法获取地域列表",
-            None,
-        )
-    }))
+    Err(last_error
+        .unwrap_or_else(|| ApiError::new("DescribeRegionsFailed", "无法获取地域列表", None)))
 }
 
 async fn security_group_exists_in_region(
@@ -832,13 +906,7 @@ async fn get_caller_identity(
 ) -> Result<Value, ApiError> {
     let params = BTreeMap::new();
     client
-        .call_rpc_json(
-            STS_HOST,
-            "GetCallerIdentity",
-            STS_VERSION,
-            account,
-            &params,
-        )
+        .call_rpc_json(STS_HOST, "GetCallerIdentity", STS_VERSION, account, &params)
         .await
 }
 
@@ -922,11 +990,314 @@ fn normalize_ipv4_or_cidr(input: &str) -> Result<(String, String), String> {
     Ok((ip.to_string(), format!("{ip}/32")))
 }
 
+fn home_dir_path() -> Result<PathBuf, String> {
+    if let Some(home) = env::var_os("HOME") {
+        return Ok(PathBuf::from(home));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(profile) = env::var_os("USERPROFILE") {
+            return Ok(PathBuf::from(profile));
+        }
+        if let (Some(drive), Some(path)) = (env::var_os("HOMEDRIVE"), env::var_os("HOMEPATH")) {
+            let mut combined = PathBuf::from(drive);
+            combined.push(path);
+            return Ok(combined);
+        }
+    }
+
+    Err("无法获取当前用户的 Home 目录".to_string())
+}
+
+fn collect_ssh_aliases_from_file(
+    path: &Path,
+    home_dir: &Path,
+    visited_files: &mut HashSet<PathBuf>,
+    aliases: &mut BTreeMap<String, SshAliasSource>,
+) -> Result<(), String> {
+    let normalized_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited_files.insert(normalized_path) {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(path)
+        .map_err(|err| format!("读取 SSH 配置失败：{} ({err})", path.display()))?;
+    let base_dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    for (index, raw_line) in content.lines().enumerate() {
+        let tokens = parse_ssh_line_tokens(raw_line);
+        if tokens.is_empty() {
+            continue;
+        }
+
+        let key = tokens[0].to_ascii_lowercase();
+        if key == "include" {
+            for pattern in tokens.iter().skip(1) {
+                let include_paths = expand_ssh_include_pattern(pattern, &base_dir, home_dir)?;
+                for include_path in include_paths {
+                    if include_path.is_file() {
+                        collect_ssh_aliases_from_file(
+                            &include_path,
+                            home_dir,
+                            visited_files,
+                            aliases,
+                        )?;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if key == "host" {
+            for alias in tokens.iter().skip(1) {
+                if !is_explicit_ssh_alias(alias) {
+                    continue;
+                }
+                aliases.entry(alias.to_string()).or_insert(SshAliasSource {
+                    source_file: path.display().to_string(),
+                    source_line: index + 1,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_ssh_line_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote_char: Option<char> = None;
+
+    for ch in line.chars() {
+        if let Some(quote) = quote_char {
+            if ch == quote {
+                quote_char = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '#' => break,
+            '"' | '\'' => {
+                quote_char = Some(ch);
+            }
+            _ if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn expand_ssh_include_pattern(
+    pattern: &str,
+    base_dir: &Path,
+    home_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let path_with_home = if trimmed == "~" {
+        home_dir.to_path_buf()
+    } else if let Some(suffix) = trimmed.strip_prefix("~/") {
+        home_dir.join(suffix)
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    let resolved_pattern = if path_with_home.is_absolute() {
+        path_with_home
+    } else {
+        base_dir.join(path_with_home)
+    };
+
+    let pattern_text = resolved_pattern.to_string_lossy().to_string();
+    if pattern_text.contains('*') || pattern_text.contains('?') || pattern_text.contains('[') {
+        let mut matched = Vec::new();
+        for entry in glob::glob(&pattern_text).map_err(|err| {
+            format!(
+                "解析 Include 通配符失败：{} ({err})",
+                resolved_pattern.display()
+            )
+        })? {
+            match entry {
+                Ok(file) => matched.push(file),
+                Err(err) => {
+                    return Err(format!("展开 Include 失败：{err}"));
+                }
+            }
+        }
+        matched.sort();
+        return Ok(matched);
+    }
+
+    if resolved_pattern.exists() {
+        return Ok(vec![resolved_pattern]);
+    }
+    Ok(Vec::new())
+}
+
+fn is_explicit_ssh_alias(alias: &str) -> bool {
+    let trimmed = alias.trim();
+    if trimmed.is_empty() || trimmed.starts_with('!') {
+        return false;
+    }
+    !trimmed
+        .chars()
+        .any(|ch| ch == '*' || ch == '?' || ch == '[' || ch == ']')
+}
+
+fn resolve_ssh_shortcut_row(alias: String, source: SshAliasSource) -> SshShortcutRow {
+    let mut row = SshShortcutRow {
+        alias: alias.clone(),
+        host_name: None,
+        port: None,
+        user: None,
+        identity_file: None,
+        proxy_jump: None,
+        source_file: Some(source.source_file),
+        source_line: Some(source.source_line),
+        error: None,
+    };
+
+    let output = Command::new("ssh").arg("-G").arg(&alias).output();
+    match output {
+        Ok(output) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                row.error = Some(if stderr.is_empty() {
+                    format!("ssh -G {} 执行失败", alias)
+                } else {
+                    stderr
+                });
+                return row;
+            }
+
+            let parsed = parse_ssh_g_output(&String::from_utf8_lossy(&output.stdout));
+            row.host_name = sanitize_optional_value(parsed.get("hostname").cloned());
+            row.port = sanitize_optional_value(parsed.get("port").cloned());
+            row.user = sanitize_optional_value(parsed.get("user").cloned());
+            row.identity_file = sanitize_optional_value(parsed.get("identityfile").cloned());
+            row.proxy_jump = sanitize_optional_value(parsed.get("proxyjump").cloned());
+        }
+        Err(err) => {
+            row.error = Some(format!("执行 ssh -G 失败：{err}"));
+        }
+    }
+
+    row
+}
+
+fn parse_ssh_g_output(output: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let value = parts.collect::<Vec<_>>().join(" ");
+        map.insert(key.to_ascii_lowercase(), value);
+    }
+    map
+}
+
+fn sanitize_optional_value(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let normalized = raw.trim();
+        if normalized.is_empty() || normalized.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            Some(normalized.to_string())
+        }
+    })
+}
+
+fn validate_alias(alias: &str) -> Result<&str, String> {
+    let trimmed = alias.trim();
+    if trimmed.is_empty() {
+        return Err("SSH 别名不能为空".to_string());
+    }
+
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '@' | ':'))
+    {
+        return Err("SSH 别名包含非法字符，仅允许字母数字和 . _ - @ :".to_string());
+    }
+
+    Ok(trimmed)
+}
+
+#[cfg(target_os = "macos")]
+fn open_ssh_terminal_macos(alias: &str) -> Result<(), String> {
+    let command = format!("ssh {}", alias);
+    let escaped_command = command.replace('\\', "\\\\").replace('"', "\\\"");
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"Terminal\" to activate")
+        .arg("-e")
+        .arg(format!(
+            "tell application \"Terminal\" to do script \"{}\"",
+            escaped_command
+        ))
+        .status()
+        .map_err(|err| format!("启动 Terminal 失败：{err}"))?;
+
+    if !status.success() {
+        return Err("启动 Terminal 失败".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn open_ssh_terminal_windows(alias: &str) -> Result<(), String> {
+    let ssh_command = format!("ssh {}", alias);
+    let status = Command::new("cmd")
+        .args(["/C", "start", "", "cmd", "/K", &ssh_command])
+        .status()
+        .map_err(|err| format!("启动命令行失败：{err}"))?;
+
+    if !status.success() {
+        return Err("启动命令行失败".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_ssh_terminal_linux(alias: &str) -> Result<(), String> {
+    let launchers: [(&str, Vec<&str>); 3] = [
+        ("x-terminal-emulator", vec!["-e", "ssh", alias]),
+        ("gnome-terminal", vec!["--", "ssh", alias]),
+        ("konsole", vec!["-e", "ssh", alias]),
+    ];
+
+    for (bin, args) in launchers {
+        if Command::new(bin).args(args).spawn().is_ok() {
+            return Ok(());
+        }
+    }
+
+    Err("未找到可用终端程序，请手动执行 ssh <alias>".to_string())
+}
+
 fn trim_to_option(value: &Option<String>) -> Option<&str> {
-    value
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+    value.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
 }
 
 fn ecs_host(region_id: &str) -> String {
@@ -972,7 +1343,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             detect_public_ip,
             verify_account,
-            sync_all
+            sync_all,
+            list_ssh_shortcuts,
+            open_ssh_terminal
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
