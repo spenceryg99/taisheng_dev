@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import "antd/dist/reset.css";
+import "@radix-ui/themes/styles.css";
 import App from "./App";
 import "./styles.css";
 

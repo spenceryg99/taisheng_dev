@@ -61,6 +61,10 @@ struct SyncRequest {
 struct PublicIpResponse {
     ip: String,
     cidr: String,
+    carrier: Option<String>,
+    location: Option<String>,
+    isp: Option<String>,
+    org: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,6 +127,26 @@ struct SecurityRule {
     rule_id: Option<String>,
     source_cidr_ip: Option<String>,
     description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppWorldsIpData {
+    ip: Option<String>,
+    country: Option<String>,
+    province: Option<String>,
+    region: Option<String>,
+    city: Option<String>,
+    #[serde(rename = "fullAddress")]
+    full_address: Option<String>,
+    other: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppWorldsIpResponse {
+    code: Option<i64>,
+    data: Option<AppWorldsIpData>,
+    msg: Option<String>,
 }
 
 #[derive(Debug)]
@@ -314,12 +338,21 @@ impl AlibabaOpenApiClient {
 #[tauri::command]
 async fn detect_public_ip() -> Result<PublicIpResponse, String> {
     let client = AlibabaOpenApiClient::new()?;
+    if let Ok(response) = lookup_current_public_ip_profile(&client.http).await {
+        return Ok(response);
+    }
+
     let ip = detect_public_ipv4(&client.http)
         .await
         .map_err(|err| err.to_string())?;
+    let metadata = lookup_ip_metadata(&client.http, &ip).await.ok();
     Ok(PublicIpResponse {
         cidr: format!("{ip}/32"),
         ip,
+        carrier: metadata.as_ref().and_then(|item| item.carrier.clone()),
+        location: metadata.as_ref().and_then(|item| item.location.clone()),
+        isp: metadata.as_ref().and_then(|item| item.isp.clone()),
+        org: metadata.as_ref().and_then(|item| item.org.clone()),
     })
 }
 
@@ -912,7 +945,9 @@ async fn get_caller_identity(
 
 async fn detect_public_ipv4(http: &reqwest::Client) -> Result<String, ApiError> {
     let sources = [
+        "https://api.ipsimple.org/ipv4?format=json",
         "https://api64.ipify.org?format=json",
+        "https://4.ipw.cn",
         "https://ipv4.icanhazip.com",
         "https://ifconfig.me/ip",
     ];
@@ -946,6 +981,196 @@ async fn detect_public_ipv4(http: &reqwest::Client) -> Result<String, ApiError> 
         },
         None,
     ))
+}
+
+async fn lookup_current_public_ip_profile(
+    http: &reqwest::Client,
+) -> Result<PublicIpResponse, ApiError> {
+    // Use appworlds API as the primary source for current IP + geolocation + carrier.
+    let payload = fetch_appworlds_data(http, None)
+        .await
+        .map_err(|err| ApiError::new("PublicIpGeoLookupFailed", err.message, err.request_id))?;
+
+    let ip = payload
+        .ip
+        .as_deref()
+        .filter(|value| value.parse::<Ipv4Addr>().is_ok())
+        .ok_or_else(|| ApiError::new("PublicIpGeoInvalid", "公网 IP 服务未返回有效 IPv4", None))?;
+
+    Ok(PublicIpResponse {
+        ip: ip.to_string(),
+        cidr: format!("{ip}/32"),
+        carrier: infer_network_carrier(
+            payload.other.as_deref(),
+            payload.full_address.as_deref(),
+            None,
+            false,
+        ),
+        location: appworlds_location(&payload),
+        isp: trim_str_to_option(payload.other.as_deref()).map(ToString::to_string),
+        org: trim_str_to_option(payload.full_address.as_deref()).map(ToString::to_string),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct PublicIpMetadata {
+    carrier: Option<String>,
+    location: Option<String>,
+    isp: Option<String>,
+    org: Option<String>,
+}
+
+async fn lookup_ip_metadata(
+    http: &reqwest::Client,
+    ip: &str,
+) -> Result<PublicIpMetadata, ApiError> {
+    let payload = fetch_appworlds_data(http, Some(ip)).await?;
+
+    Ok(PublicIpMetadata {
+        carrier: infer_network_carrier(
+            payload.other.as_deref(),
+            payload.full_address.as_deref(),
+            None,
+            false,
+        ),
+        location: appworlds_location(&payload),
+        isp: trim_str_to_option(payload.other.as_deref()).map(ToString::to_string),
+        org: trim_str_to_option(payload.full_address.as_deref()).map(ToString::to_string),
+    })
+}
+
+async fn fetch_appworlds_data(
+    http: &reqwest::Client,
+    ip: Option<&str>,
+) -> Result<AppWorldsIpData, ApiError> {
+    let endpoint = if let Some(ip) = ip {
+        format!("https://ip.appworlds.cn?ip={ip}")
+    } else {
+        "https://ip.appworlds.cn".to_string()
+    };
+
+    for attempt in 0..2 {
+        let response = http.get(&endpoint).send().await.map_err(|err| {
+            ApiError::new("IpMetadataLookupFailed", format!("查询 IP 归属地失败: {err}"), None)
+        })?;
+
+        let payload: AppWorldsIpResponse = response.json().await.map_err(|err| {
+            ApiError::new(
+                "IpMetadataParseFailed",
+                format!("解析 IP 归属地响应失败: {err}"),
+                None,
+            )
+        })?;
+
+        if payload.code == Some(200) {
+            return payload.data.ok_or_else(|| {
+                ApiError::new(
+                    "IpMetadataLookupFailed",
+                    "IP 归属地服务未返回有效 data".to_string(),
+                    None,
+                )
+            });
+        }
+
+        let msg = payload
+            .msg
+            .unwrap_or_else(|| "IP 归属地服务返回失败".to_string());
+        let rate_limited =
+            payload.code == Some(300) || msg.contains("1次/秒") || msg.contains("访问频率");
+
+        if rate_limited && attempt == 0 {
+            std::thread::sleep(Duration::from_millis(1100));
+            continue;
+        }
+
+        return Err(ApiError::new("IpMetadataLookupFailed", msg, None));
+    }
+
+    Err(ApiError::new(
+        "IpMetadataLookupFailed",
+        "IP 归属地服务返回失败".to_string(),
+        None,
+    ))
+}
+
+fn appworlds_location(payload: &AppWorldsIpData) -> Option<String> {
+    if let Some(full) = trim_str_to_option(payload.full_address.as_deref()) {
+        return Some(full.to_string());
+    }
+
+    format_location(
+        payload.country.as_deref(),
+        payload
+            .province
+            .as_deref()
+            .or(payload.region.as_deref()),
+        payload.city.as_deref(),
+    )
+}
+
+fn format_location(
+    country: Option<&str>,
+    region_name: Option<&str>,
+    city: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in [country, region_name, city] {
+        if let Some(value) = trim_str_to_option(part) {
+            if !parts.iter().any(|item: &String| item == value) {
+                parts.push(value.to_string());
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn infer_network_carrier(
+    isp: Option<&str>,
+    org: Option<&str>,
+    as_name: Option<&str>,
+    mobile: bool,
+) -> Option<String> {
+    let joined = [isp, org, as_name]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let haystack = joined.to_lowercase();
+
+    if haystack.contains("电信") || haystack.contains("telecom") || haystack.contains("chinanet")
+    {
+        return Some("中国电信".to_string());
+    }
+    if haystack.contains("联通") || haystack.contains("unicom") || haystack.contains("cucc") {
+        return Some("中国联通".to_string());
+    }
+    if haystack.contains("移动") || haystack.contains("mobile") || haystack.contains("cmcc") {
+        return Some("中国移动".to_string());
+    }
+    if haystack.contains("广电")
+        || haystack.contains("broadnet")
+        || haystack.contains("radio and television")
+    {
+        return Some("中国广电".to_string());
+    }
+    if haystack.contains("铁通") || haystack.contains("tietong") {
+        return Some("中国铁通".to_string());
+    }
+    if haystack.contains("教育网") || haystack.contains("cernet") {
+        return Some("中国教育网".to_string());
+    }
+    if mobile {
+        return Some("移动网络".to_string());
+    }
+
+    trim_str_to_option(isp)
+        .or_else(|| trim_str_to_option(org))
+        .or_else(|| trim_str_to_option(as_name))
+        .map(ToString::to_string)
 }
 
 fn parse_ip_from_response(body: &str) -> Option<String> {
@@ -1298,6 +1523,10 @@ fn open_ssh_terminal_linux(alias: &str) -> Result<(), String> {
 
 fn trim_to_option(value: &Option<String>) -> Option<&str> {
     value.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
+}
+
+fn trim_str_to_option(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
 }
 
 fn ecs_host(region_id: &str) -> String {
