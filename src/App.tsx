@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Button,
   Card,
@@ -8,6 +9,7 @@ import {
   ConfigProvider,
   Input,
   Layout,
+  Popconfirm,
   Segmented,
   Select,
   Space,
@@ -28,6 +30,7 @@ import {
   DownloadOutlined,
   EyeInvisibleOutlined,
   EyeOutlined,
+  GlobalOutlined,
   LinkOutlined,
   MoonOutlined,
   PlusOutlined,
@@ -41,10 +44,11 @@ import {
 
 type Nullable<T> = T | null;
 type StatusType = "info" | "success" | "warning" | "error";
-type ModuleKey = "aliyun" | "ssh" | "pdd";
+type ModuleKey = "aliyun" | "ssh" | "pdd" | "website";
 type SshViewMode = "enabled" | "all";
 type ThemeMode = "light" | "dark";
 type PddViewMode = "manage" | "sync";
+type SshConnectionState = "unknown" | "success" | "failed";
 
 interface AccountInput {
   id: string;
@@ -121,6 +125,14 @@ interface SshShortcutRow {
   sourceFile?: string | null;
   sourceLine?: number | null;
   error?: string | null;
+}
+
+interface SshConnectionTestResult {
+  alias: string;
+  status: SshConnectionState;
+  exitCode?: number | null;
+  output: string;
+  checkedAt: string;
 }
 
 interface PddStoreItem {
@@ -207,10 +219,19 @@ interface PddPersistedState {
   syncServerAlias?: string | null;
 }
 
+interface WebsiteEntry {
+  id: string;
+  name: string;
+  url: string;
+  username: string;
+  password: string;
+}
+
 const STORAGE_KEY = "aliyun-whitelist-config-v2";
 const SSH_HIDDEN_STORAGE_KEY = "ssh-hidden-aliases-v1";
 const THEME_MODE_STORAGE_KEY = "desktop-theme-mode-v2";
 const PDD_STORAGE_KEY = "pdd-open-platform-manager-v1";
+const WEBSITE_STORAGE_KEY = "website-login-manager-v1";
 const PDD_DEFAULT_LOGIN_URL = "https://open.pinduoduo.com/application/home";
 const PDD_LEGACY_LOGIN_URL = "https://mms.pinduoduo.com/login/";
 const PDD_SYNC_TASK_OPTIONS: { label: string; value: number }[] = [
@@ -277,6 +298,27 @@ function pddSyncStatusLabel(status: string): string {
   }
 }
 
+function sshStatusText(status: SshConnectionState): string {
+  switch (status) {
+    case "success":
+      return "连接成功";
+    case "failed":
+      return "连接失败";
+    default:
+      return "未知";
+  }
+}
+
+function makeUnknownSshStatus(alias: string): SshConnectionTestResult {
+  return {
+    alias,
+    status: "unknown",
+    exitCode: null,
+    output: "尚未测试该连接",
+    checkedAt: "",
+  };
+}
+
 async function copyTextToClipboard(text: string): Promise<void> {
   if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
@@ -337,6 +379,27 @@ function blankPddAccount(): PddAccountInput {
     cookieCheckedAt: null,
     cookieReason: null,
   };
+}
+
+function blankWebsiteEntry(): WebsiteEntry {
+  return {
+    id: uid("website"),
+    name: "",
+    url: "",
+    username: "",
+    password: "",
+  };
+}
+
+function normalizeWebsiteUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+  return `https://${trimmed}`;
 }
 
 function ensureBaseRows(
@@ -416,6 +479,12 @@ export default function App() {
   const [sshShortcuts, setSshShortcuts] = useState<SshShortcutRow[]>([]);
   const [sshViewMode, setSshViewMode] = useState<SshViewMode>("enabled");
   const [hiddenSshAliases, setHiddenSshAliases] = useState<string[]>([]);
+  const [sshConnectionStatusMap, setSshConnectionStatusMap] = useState<
+    Record<string, SshConnectionTestResult>
+  >({});
+  const [testingSshAlias, setTestingSshAlias] = useState<string | null>(null);
+  const [testingAllSsh, setTestingAllSsh] = useState(false);
+  const [deletingSshAlias, setDeletingSshAlias] = useState<string | null>(null);
   const [aliyunSection, setAliyunSection] = useState<"run" | "accounts" | "targets">("run");
   const [showAccountEditor, setShowAccountEditor] = useState(false);
   const [showTargetEditor, setShowTargetEditor] = useState(false);
@@ -435,6 +504,8 @@ export default function App() {
   const [pddSyncSteps, setPddSyncSteps] = useState<PddSyncStepResult[]>([]);
   const [pddSyncActiveStepKey, setPddSyncActiveStepKey] = useState<string | null>(null);
   const [pddViewMode, setPddViewMode] = useState<PddViewMode>("manage");
+  const [websiteEntries, setWebsiteEntries] = useState<WebsiteEntry[]>([]);
+  const [openingWebsiteId, setOpeningWebsiteId] = useState<string | null>(null);
 
   const bootstrappedRef = useRef(false);
   const sshBootstrappedRef = useRef(false);
@@ -481,6 +552,26 @@ export default function App() {
   const hiddenSshCount = useMemo(
     () => sshShortcuts.filter((row) => hiddenAliasSet.has(row.alias)).length,
     [sshShortcuts, hiddenAliasSet]
+  );
+  const testedSshCount = useMemo(
+    () =>
+      sshShortcuts.filter((row) => {
+        const status = sshConnectionStatusMap[row.alias]?.status ?? "unknown";
+        return status !== "unknown";
+      }).length,
+    [sshConnectionStatusMap, sshShortcuts]
+  );
+  const successSshCount = useMemo(
+    () =>
+      sshShortcuts.filter((row) => (sshConnectionStatusMap[row.alias]?.status ?? "unknown") === "success")
+        .length,
+    [sshConnectionStatusMap, sshShortcuts]
+  );
+  const failedSshCount = useMemo(
+    () =>
+      sshShortcuts.filter((row) => (sshConnectionStatusMap[row.alias]?.status ?? "unknown") === "failed")
+        .length,
+    [sshConnectionStatusMap, sshShortcuts]
   );
 
   const filteredSshRows = useMemo(() => {
@@ -541,6 +632,10 @@ export default function App() {
         0
       ),
     [pddAccounts]
+  );
+  const websiteConfiguredCount = useMemo(
+    () => websiteEntries.filter((item) => item.url.trim().length > 0).length,
+    [websiteEntries]
   );
   const pddActiveSyncStep = useMemo(() => {
     if (pddSyncSteps.length === 0) {
@@ -752,6 +847,113 @@ export default function App() {
       setPddSyncServerAlias(undefined);
       pddConfigLoadedRef.current = true;
       messageApi.error(`加载拼多多配置失败: ${detail}`);
+    }
+  };
+
+  const persistWebsiteEntries = (
+    nextEntries: WebsiteEntry[] = websiteEntries,
+    shouldToast = true
+  ): void => {
+    localStorage.setItem(WEBSITE_STORAGE_KEY, JSON.stringify(nextEntries));
+    if (shouldToast) {
+      messageApi.success("网址配置已保存");
+    }
+  };
+
+  const loadWebsiteEntries = (shouldToast = true): void => {
+    const raw = localStorage.getItem(WEBSITE_STORAGE_KEY);
+    if (!raw) {
+      const base = [blankWebsiteEntry()];
+      setWebsiteEntries(base);
+      if (shouldToast) {
+        messageApi.info("已创建默认网址条目");
+      }
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as WebsiteEntry[] | { entries?: WebsiteEntry[] };
+      const sourceRows = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed.entries)
+          ? parsed.entries
+          : [];
+      const loadedRows = sourceRows.map((item) => ({
+        ...blankWebsiteEntry(),
+        ...item,
+        id: item.id || uid("website"),
+        name: String(item.name || ""),
+        url: String(item.url || ""),
+        username: String(item.username || ""),
+        password: String(item.password || ""),
+      }));
+      const ensuredRows = loadedRows.length > 0 ? loadedRows : [blankWebsiteEntry()];
+      setWebsiteEntries(ensuredRows);
+      if (shouldToast) {
+        messageApi.success("已加载网址配置");
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setWebsiteEntries([blankWebsiteEntry()]);
+      messageApi.error(`加载网址配置失败: ${detail}`);
+    }
+  };
+
+  const updateWebsiteEntry = (id: string, patch: Partial<WebsiteEntry>): void => {
+    setWebsiteEntries((prev) => {
+      const next = prev.map((item) => (item.id === id ? { ...item, ...patch } : item));
+      persistWebsiteEntries(next, false);
+      return next;
+    });
+  };
+
+  const addWebsiteEntry = (): void => {
+    setWebsiteEntries((prev) => {
+      const next = [...prev, blankWebsiteEntry()];
+      persistWebsiteEntries(next, false);
+      return next;
+    });
+  };
+
+  const deleteWebsiteEntry = (id: string): void => {
+    setWebsiteEntries((prev) => {
+      const next = prev.filter((item) => item.id !== id);
+      const ensured = next.length > 0 ? next : [blankWebsiteEntry()];
+      persistWebsiteEntries(ensured, false);
+      return ensured;
+    });
+  };
+
+  const openWebsiteUrl = async (entry: WebsiteEntry): Promise<void> => {
+    const rawUrl = entry.url.trim();
+    if (!rawUrl) {
+      messageApi.warning("请先填写网址");
+      return;
+    }
+
+    const normalizedUrl = normalizeWebsiteUrl(rawUrl);
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(normalizedUrl);
+    } catch {
+      messageApi.warning("网址格式不正确，请输入有效地址");
+      return;
+    }
+
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+      messageApi.warning("仅支持 http 或 https 协议");
+      return;
+    }
+
+    setOpeningWebsiteId(entry.id);
+    try {
+      await openUrl(parsedUrl.toString());
+      messageApi.success(`已打开 ${entry.name.trim() || parsedUrl.hostname}`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      messageApi.error(`打开网址失败: ${detail}`);
+    } finally {
+      setOpeningWebsiteId(null);
     }
   };
 
@@ -997,6 +1199,13 @@ export default function App() {
     try {
       const rows = await invoke<SshShortcutRow[]>("list_ssh_shortcuts");
       setSshShortcuts(rows);
+      setSshConnectionStatusMap((prev) => {
+        const next: Record<string, SshConnectionTestResult> = {};
+        rows.forEach((row) => {
+          next[row.alias] = prev[row.alias] ?? makeUnknownSshStatus(row.alias);
+        });
+        return next;
+      });
       const aliasSet = new Set(rows.map((item) => item.alias));
       setHiddenSshAliases((prev) => {
         const next = prev.filter((alias) => aliasSet.has(alias));
@@ -1029,6 +1238,89 @@ export default function App() {
     }
   };
 
+  const testSshShortcut = async (alias: string): Promise<void> => {
+    setTestingSshAlias(alias);
+    try {
+      const result = await invoke<SshConnectionTestResult>("test_ssh_shortcut", { alias });
+      setSshConnectionStatusMap((prev) => ({ ...prev, [alias]: result }));
+      if (result.status === "success") {
+        messageApi.success(`${alias} 连接测试成功`);
+      } else {
+        messageApi.error(`${alias} 连接测试失败`);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const failed: SshConnectionTestResult = {
+        alias,
+        status: "failed",
+        exitCode: null,
+        output: detail,
+        checkedAt: new Date().toISOString(),
+      };
+      setSshConnectionStatusMap((prev) => ({ ...prev, [alias]: failed }));
+      messageApi.error(`测试 ${alias} 失败: ${detail}`);
+    } finally {
+      setTestingSshAlias(null);
+    }
+  };
+
+  const testAllSshShortcuts = async (): Promise<void> => {
+    if (sshShortcuts.length === 0) {
+      messageApi.warning("没有可测试的 SSH 快捷连接");
+      return;
+    }
+    setTestingAllSsh(true);
+    try {
+      const results = await invoke<SshConnectionTestResult[]>("test_all_ssh_shortcuts");
+      setSshConnectionStatusMap((prev) => {
+        const next = { ...prev };
+        results.forEach((item) => {
+          next[item.alias] = item;
+        });
+        return next;
+      });
+      const successCount = results.filter((item) => item.status === "success").length;
+      const failedCount = results.length - successCount;
+      if (failedCount > 0) {
+        messageApi.warning(`批量测试完成：成功 ${successCount}，失败 ${failedCount}`);
+      } else {
+        messageApi.success(`批量测试完成：共 ${successCount} 条，全部成功`);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      messageApi.error(`批量测试失败: ${detail}`);
+    } finally {
+      setTestingAllSsh(false);
+    }
+  };
+
+  const deleteSshShortcut = async (alias: string): Promise<void> => {
+    setDeletingSshAlias(alias);
+    try {
+      const result = await invoke<string>("delete_ssh_shortcut", { alias });
+      setHiddenSshAliases((prev) => {
+        if (!prev.includes(alias)) {
+          return prev;
+        }
+        const next = prev.filter((item) => item !== alias);
+        localStorage.setItem(SSH_HIDDEN_STORAGE_KEY, JSON.stringify(next));
+        return next;
+      });
+      setSshConnectionStatusMap((prev) => {
+        const next = { ...prev };
+        delete next[alias];
+        return next;
+      });
+      await loadSshShortcuts(false);
+      messageApi.success(result || `已删除 SSH 快捷连接 ${alias}`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      messageApi.error(`删除 ${alias} 失败: ${detail}`);
+    } finally {
+      setDeletingSshAlias(null);
+    }
+  };
+
   const toggleSshAliasVisibility = (alias: string): void => {
     setHiddenSshAliases((prev) => {
       const exists = prev.includes(alias);
@@ -1053,6 +1345,7 @@ export default function App() {
 
     loadConfig(false);
     loadPddConfig(false);
+    loadWebsiteEntries(false);
     setHiddenSshAliases(readHiddenSshAliases());
 
     void (async () => {
@@ -1485,7 +1778,7 @@ export default function App() {
     {
       title: "快捷命令",
       dataIndex: "alias",
-      width: "20%",
+      width: "18%",
       render: (_, record) => (
         <Space>
           <Typography.Text strong>{record.alias}</Typography.Text>
@@ -1497,25 +1790,40 @@ export default function App() {
     {
       title: "Host/IP",
       dataIndex: "hostName",
-      width: "24%",
+      width: "22%",
       render: (_, record) => record.hostName || "-",
     },
     {
       title: "端口",
       dataIndex: "port",
-      width: "10%",
+      width: "8%",
       render: (_, record) => record.port || "-",
     },
     {
       title: "用户",
       dataIndex: "user",
-      width: "12%",
+      width: "10%",
       render: (_, record) => record.user || "-",
+    },
+    {
+      title: "连接状态",
+      key: "connectionStatus",
+      width: "14%",
+      render: (_, record) => {
+        const status = sshConnectionStatusMap[record.alias]?.status ?? "unknown";
+        if (status === "success") {
+          return <Tag color="success">成功</Tag>;
+        }
+        if (status === "failed") {
+          return <Tag color="error">失败</Tag>;
+        }
+        return <Tag color="default">未知</Tag>;
+      },
     },
     {
       title: "显示",
       key: "visibility",
-      width: "14%",
+      width: "8%",
       render: (_, record) => {
         const isHidden = hiddenAliasSet.has(record.alias);
         return (
@@ -1536,16 +1844,43 @@ export default function App() {
       key: "actions",
       width: "20%",
       render: (_, record) => (
-        <Tooltip title={`连接 ${record.alias}`}>
-          <Button
-            size="small"
-            icon={<LinkOutlined />}
-            loading={openingSshAlias === record.alias}
-            onClick={() => void openSshTerminal(record.alias)}
+        <Space size={6} wrap>
+          <Tooltip title={`测试 ${record.alias}`}>
+            <Button
+              size="small"
+              icon={<ReloadOutlined />}
+              loading={testingSshAlias === record.alias}
+              onClick={() => void testSshShortcut(record.alias)}
+            >
+              测试
+            </Button>
+          </Tooltip>
+          <Tooltip title={`连接 ${record.alias}`}>
+            <Button
+              size="small"
+              icon={<LinkOutlined />}
+              loading={openingSshAlias === record.alias}
+              onClick={() => void openSshTerminal(record.alias)}
+            >
+              连接
+            </Button>
+          </Tooltip>
+          <Popconfirm
+            title={`确认删除 ${record.alias} ?`}
+            okText="删除"
+            cancelText="取消"
+            onConfirm={() => void deleteSshShortcut(record.alias)}
           >
-            连接
-          </Button>
-        </Tooltip>
+            <Button
+              size="small"
+              danger
+              icon={<DeleteOutlined />}
+              loading={deletingSshAlias === record.alias}
+            >
+              删除
+            </Button>
+          </Popconfirm>
+        </Space>
       ),
     },
   ];
@@ -1664,6 +1999,86 @@ export default function App() {
               className="icon-action-btn"
               icon={<DeleteOutlined />}
               onClick={() => deletePddAccount(record.id)}
+            />
+          </Tooltip>
+        </Space>
+      ),
+    },
+  ];
+
+  const websiteColumns: ColumnsType<WebsiteEntry> = [
+    {
+      title: "名称",
+      dataIndex: "name",
+      width: "18%",
+      render: (_, record) => (
+        <Input
+          value={record.name}
+          placeholder="例如 阿里云控制台"
+          onChange={(event) => updateWebsiteEntry(record.id, { name: event.target.value })}
+        />
+      ),
+    },
+    {
+      title: "网址",
+      dataIndex: "url",
+      width: "34%",
+      render: (_, record) => (
+        <Input
+          value={record.url}
+          placeholder="https://console.aliyun.com"
+          onChange={(event) => updateWebsiteEntry(record.id, { url: event.target.value })}
+        />
+      ),
+    },
+    {
+      title: "账号",
+      dataIndex: "username",
+      width: "18%",
+      render: (_, record) => (
+        <Input
+          value={record.username}
+          placeholder="登录账号"
+          onChange={(event) => updateWebsiteEntry(record.id, { username: event.target.value })}
+        />
+      ),
+    },
+    {
+      title: "密码",
+      dataIndex: "password",
+      width: "14%",
+      render: (_, record) => (
+        <Input.Password
+          value={record.password}
+          placeholder="密码"
+          onChange={(event) => updateWebsiteEntry(record.id, { password: event.target.value })}
+        />
+      ),
+    },
+    {
+      title: "操作",
+      key: "actions",
+      width: "16%",
+      render: (_, record) => (
+        <Space size={6} wrap>
+          <Button
+            size="small"
+            type="primary"
+            icon={<LinkOutlined />}
+            loading={openingWebsiteId === record.id}
+            disabled={!record.url.trim()}
+            onClick={() => void openWebsiteUrl(record)}
+          >
+            一键打开
+          </Button>
+          <Tooltip title="删除条目">
+            <Button
+              size="small"
+              shape="circle"
+              danger
+              className="icon-action-btn"
+              icon={<DeleteOutlined />}
+              onClick={() => deleteWebsiteEntry(record.id)}
             />
           </Tooltip>
         </Space>
@@ -1991,6 +2406,15 @@ export default function App() {
               ) : null}
               <Button
                 size="small"
+                className="topbar-btn topbar-btn-ssh-test"
+                icon={<CloudSyncOutlined />}
+                loading={testingAllSsh}
+                onClick={() => void testAllSshShortcuts()}
+              >
+                一键测试全部
+              </Button>
+              <Button
+                size="small"
                 className="topbar-btn topbar-btn-ssh-refresh"
                 icon={<ReloadOutlined />}
                 loading={sshLoading}
@@ -2006,6 +2430,9 @@ export default function App() {
       <div className="ssh-metric-row">
         <div className="ssh-metric-chip ssh-metric-chip-visible">显示 {enabledSshCount} / 全部 {sshShortcuts.length}</div>
         <div className="ssh-metric-chip ssh-metric-chip-hidden">已隐藏 {hiddenSshCount}</div>
+        <div className="ssh-metric-chip ssh-metric-chip-tested">
+          已测试 {testedSshCount}（成功 {successSshCount} / 失败 {failedSshCount}）
+        </div>
       </div>
 
       <Card className="section-card" title="SSH 快捷连接列表">
@@ -2020,30 +2447,45 @@ export default function App() {
           tableLayout="fixed"
           locale={{ emptyText: "未读取到 SSH 快捷配置" }}
           expandable={{
-            expandedRowRender: (record) => (
-              <div className="result-detail-grid">
-                <div className="detail-item">
-                  <span>IdentityFile</span>
-                  <b>{record.identityFile || "-"}</b>
+            expandedRowRender: (record) => {
+              const status = sshConnectionStatusMap[record.alias] ?? makeUnknownSshStatus(record.alias);
+              return (
+                <div className="result-detail-grid">
+                  <div className="detail-item">
+                    <span>IdentityFile</span>
+                    <b>{record.identityFile || "-"}</b>
+                  </div>
+                  <div className="detail-item">
+                    <span>ProxyJump</span>
+                    <b>{record.proxyJump || "-"}</b>
+                  </div>
+                  <div className="detail-item">
+                    <span>来源配置</span>
+                    <b>
+                      {record.sourceFile
+                        ? `${record.sourceFile}${record.sourceLine ? `:${record.sourceLine}` : ""}`
+                        : "-"}
+                    </b>
+                  </div>
+                  <div className="detail-item">
+                    <span>解析状态</span>
+                    <b>{record.error || "正常"}</b>
+                  </div>
+                  <div className="detail-item">
+                    <span>连接状态</span>
+                    <b>{sshStatusText(status.status)}</b>
+                  </div>
+                  <div className="detail-item">
+                    <span>最近测试</span>
+                    <b>{status.checkedAt ? new Date(status.checkedAt).toLocaleString() : "-"}</b>
+                  </div>
+                  <div className="detail-item">
+                    <span>测试输出</span>
+                    <b>{status.output || "-"}</b>
+                  </div>
                 </div>
-                <div className="detail-item">
-                  <span>ProxyJump</span>
-                  <b>{record.proxyJump || "-"}</b>
-                </div>
-                <div className="detail-item">
-                  <span>来源配置</span>
-                  <b>
-                    {record.sourceFile
-                      ? `${record.sourceFile}${record.sourceLine ? `:${record.sourceLine}` : ""}`
-                      : "-"}
-                  </b>
-                </div>
-                <div className="detail-item">
-                  <span>解析状态</span>
-                  <b>{record.error || "正常"}</b>
-                </div>
-              </div>
-            ),
+              );
+            },
           }}
         />
       </Card>
@@ -2107,24 +2549,6 @@ export default function App() {
                   新增账号
                 </Button>
               ) : null}
-              <Button
-                size="small"
-                icon={<SaveOutlined />}
-                onClick={() => {
-                  persistPddConfig();
-                }}
-              >
-                保存配置
-              </Button>
-              <Button
-                size="small"
-                icon={<DownloadOutlined />}
-                onClick={() => {
-                  loadPddConfig(true);
-                }}
-              >
-                加载配置
-              </Button>
             </Space>
           </div>
         </div>
@@ -2324,6 +2748,60 @@ export default function App() {
     </div>
   );
 
+  const websitePage = (
+    <div className="workspace-stack">
+      <Card className="topbar-card" bordered={false}>
+        <div className="topbar-inner">
+          <div className="topbar-left">
+            <div className="topbar-title-col">
+              <Typography.Text strong className="topbar-title">
+                SP工具箱
+              </Typography.Text>
+              <Typography.Text className="topbar-desc">网址信息管理</Typography.Text>
+            </div>
+          </div>
+          <div className="topbar-right">
+            <Space wrap className="topbar-actions">
+              <Button
+                size="small"
+                className="topbar-btn topbar-btn-account"
+                icon={<PlusOutlined />}
+                onClick={addWebsiteEntry}
+              >
+                新增条目
+              </Button>
+            </Space>
+          </div>
+        </div>
+      </Card>
+
+      <div className="stat-row">
+        <div className="stat-card stat-card-ip">网址条目 {websiteEntries.length}</div>
+        <div className="stat-card stat-card-account">已填写网址 {websiteConfiguredCount}</div>
+        <div className="stat-card stat-card-rule">可一键打开 {websiteConfiguredCount}</div>
+      </div>
+
+      <Card className="section-card" bordered={false}>
+        <Typography.Title level={4} className="section-block-title">
+          常用网址与账号密码
+        </Typography.Title>
+        <Typography.Paragraph type="secondary" className="section-help">
+          在表格中填写名称、网址、账号和密码。点击“一键打开”会在默认浏览器打开该网址。
+        </Typography.Paragraph>
+        <Table<WebsiteEntry>
+          className="modern-table"
+          rowKey="id"
+          columns={websiteColumns}
+          dataSource={websiteEntries}
+          size="small"
+          pagination={{ pageSize: 8, showSizeChanger: false }}
+          tableLayout="fixed"
+          locale={{ emptyText: "暂无网址条目，请点击“新增条目”" }}
+        />
+      </Card>
+    </div>
+  );
+
   return (
     <Theme
       appearance={isDarkMode ? "dark" : "light"}
@@ -2374,6 +2852,18 @@ export default function App() {
                         <ShopOutlined className={`left-rail-item ${moduleKey === "pdd" ? "active" : ""}`} />
                       </button>
                     </Tooltip>
+                    <Tooltip title="网址信息管理">
+                      <button
+                        type="button"
+                        className="left-rail-switch-btn"
+                        onClick={() => setModuleKey("website")}
+                        aria-label="切换到网址信息管理"
+                      >
+                        <GlobalOutlined
+                          className={`left-rail-item ${moduleKey === "website" ? "active" : ""}`}
+                        />
+                      </button>
+                    </Tooltip>
                   </div>
                 </div>
                 <div className="left-rail-foot">
@@ -2394,7 +2884,13 @@ export default function App() {
                 </div>
               </aside>
               <div className="app-workspace">
-                {moduleKey === "aliyun" ? aliyunPage : moduleKey === "ssh" ? sshPage : pddPage}
+                {moduleKey === "aliyun"
+                  ? aliyunPage
+                  : moduleKey === "ssh"
+                    ? sshPage
+                    : moduleKey === "pdd"
+                      ? pddPage
+                      : websitePage}
               </div>
             </div>
           </Layout.Content>
