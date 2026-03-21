@@ -221,6 +221,11 @@ struct PddQuickSyncResponse {
     new_receive_id: i64,
     replaced_line: Option<usize>,
     replaced_count: usize,
+    commit_hash: Option<String>,
+    branch: Option<String>,
+    pushed: bool,
+    steps: Vec<PddSyncStepResult>,
+    remote_steps: Vec<PddSyncStepResult>,
     updated_at: String,
 }
 
@@ -230,6 +235,18 @@ struct SyncReceiveCallEntry {
     start: usize,
     end: usize,
     line_number: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PddSyncStepResult {
+    key: String,
+    step: usize,
+    title: String,
+    command: String,
+    status: String,
+    exit_code: Option<i32>,
+    output: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -852,46 +869,706 @@ fn run_pdd_quick_sync(request: PddQuickSyncRequest) -> Result<PddQuickSyncRespon
     }
 
     let file_path = resolve_input_path(&request.file_path)?;
+    let mut steps: Vec<PddSyncStepResult> = Vec::new();
+    let mut old_receive_id: Option<i64> = None;
+    let mut replaced_line: Option<usize> = None;
+    let mut replaced_count: usize = 0;
+    let mut commit_hash: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut pushed = false;
+
+    let replace_command = format!(
+        "replace task {} min sync:receive -> {}",
+        request.task_id, request.receive_id
+    );
+    let replace_result =
+        match replace_min_sync_receive_in_task(&file_path, request.task_id, request.receive_id) {
+            Ok(item) => {
+                old_receive_id = Some(item.old_receive_id);
+                replaced_line = Some(item.line_number);
+                replaced_count = 1;
+                steps.push(build_sync_step_result(
+                    "replace",
+                    1,
+                    "替换文件",
+                    &replace_command,
+                    "success",
+                    None,
+                    format!(
+                        "已将第 {} 行 sync:receive {} 替换为 {}",
+                        item.line_number, item.old_receive_id, request.receive_id
+                    ),
+                ));
+                item
+            }
+            Err(err) => {
+                steps.push(build_sync_step_result(
+                    "replace",
+                    1,
+                    "替换文件",
+                    &replace_command,
+                    "failed",
+                    None,
+                    err.clone(),
+                ));
+                return Ok(build_pdd_quick_sync_response(
+                    &request,
+                    &file_path,
+                    old_receive_id,
+                    replaced_line,
+                    replaced_count,
+                    commit_hash,
+                    branch,
+                    pushed,
+                    steps,
+                    format!("一键同步失败：替换步骤执行失败（{err}）"),
+                ));
+            }
+        };
+
+    let git_context = match prepare_git_commit_context(&file_path) {
+        Ok(context) => context,
+        Err(err) => {
+            steps.push(build_sync_step_result(
+                "git-commit",
+                2,
+                "Git 提交",
+                "git add -- <file> && git commit -m <message>",
+                "failed",
+                None,
+                err.clone(),
+            ));
+            steps.push(build_sync_step_result(
+                "git-push",
+                3,
+                "Git 推送",
+                "git push origin <branch>",
+                "skipped",
+                None,
+                "因上一步失败，已跳过".to_string(),
+            ));
+            steps.push(build_sync_step_result(
+                "ssh-connect",
+                4,
+                "连接服务器",
+                &format!("ssh {} \"echo [connect-ok]\"", server_alias),
+                "skipped",
+                None,
+                "因上一步失败，已跳过".to_string(),
+            ));
+            steps.extend(build_skipped_remote_sync_steps(
+                request.receive_id,
+                "因上一步失败，已跳过",
+            ));
+            return Ok(build_pdd_quick_sync_response(
+                &request,
+                &file_path,
+                old_receive_id,
+                replaced_line,
+                replaced_count,
+                commit_hash,
+                branch,
+                pushed,
+                steps,
+                format!("一键同步失败：Git 提交准备失败（{err}）"),
+            ));
+        }
+    };
+
+    branch = Some(git_context.branch.clone());
+
+    match commit_single_file(
+        &git_context,
+        request.task_id,
+        replace_result.old_receive_id,
+        request.receive_id,
+    ) {
+        Ok(hash) => {
+            commit_hash = Some(hash.clone());
+            steps.push(build_sync_step_result(
+                "git-commit",
+                2,
+                "Git 提交",
+                &format!(
+                    "git add -- {} && git commit -m <message>",
+                    git_context.relative_text
+                ),
+                "success",
+                Some(0),
+                format!("提交成功，commit={hash}"),
+            ));
+        }
+        Err(err) => {
+            steps.push(build_sync_step_result(
+                "git-commit",
+                2,
+                "Git 提交",
+                &format!(
+                    "git add -- {} && git commit -m <message>",
+                    git_context.relative_text
+                ),
+                "failed",
+                None,
+                err.clone(),
+            ));
+            steps.push(build_sync_step_result(
+                "git-push",
+                3,
+                "Git 推送",
+                &format!("git push origin {}", git_context.branch),
+                "skipped",
+                None,
+                "因上一步失败，已跳过".to_string(),
+            ));
+            steps.push(build_sync_step_result(
+                "ssh-connect",
+                4,
+                "连接服务器",
+                &format!("ssh {} \"echo [connect-ok]\"", server_alias),
+                "skipped",
+                None,
+                "因上一步失败，已跳过".to_string(),
+            ));
+            steps.extend(build_skipped_remote_sync_steps(
+                request.receive_id,
+                "因上一步失败，已跳过",
+            ));
+            return Ok(build_pdd_quick_sync_response(
+                &request,
+                &file_path,
+                old_receive_id,
+                replaced_line,
+                replaced_count,
+                commit_hash,
+                branch,
+                pushed,
+                steps,
+                format!("一键同步失败：Git 提交失败（{err}）"),
+            ));
+        }
+    }
+
+    match push_git_branch(&git_context) {
+        Ok(_) => {
+            pushed = true;
+            steps.push(build_sync_step_result(
+                "git-push",
+                3,
+                "Git 推送",
+                &format!("git push origin {}", git_context.branch),
+                "success",
+                Some(0),
+                format!("已推送到 origin/{}", git_context.branch),
+            ));
+        }
+        Err(err) => {
+            steps.push(build_sync_step_result(
+                "git-push",
+                3,
+                "Git 推送",
+                &format!("git push origin {}", git_context.branch),
+                "failed",
+                None,
+                err.clone(),
+            ));
+            steps.push(build_sync_step_result(
+                "ssh-connect",
+                4,
+                "连接服务器",
+                &format!("ssh {} \"echo [connect-ok]\"", server_alias),
+                "skipped",
+                None,
+                "因上一步失败，已跳过".to_string(),
+            ));
+            steps.extend(build_skipped_remote_sync_steps(
+                request.receive_id,
+                "因上一步失败，已跳过",
+            ));
+            return Ok(build_pdd_quick_sync_response(
+                &request,
+                &file_path,
+                old_receive_id,
+                replaced_line,
+                replaced_count,
+                commit_hash,
+                branch,
+                pushed,
+                steps,
+                format!("一键同步失败：Git 推送失败（{err}）"),
+            ));
+        }
+    }
+
+    match run_ssh_command(server_alias, "echo '[connect-ok]'") {
+        Ok((exit_code, output)) if exit_code == 0 => {
+            steps.push(build_sync_step_result(
+                "ssh-connect",
+                4,
+                "连接服务器",
+                &format!("ssh {} \"echo [connect-ok]\"", server_alias),
+                "success",
+                Some(exit_code),
+                output,
+            ));
+        }
+        Ok((exit_code, output)) => {
+            steps.push(build_sync_step_result(
+                "ssh-connect",
+                4,
+                "连接服务器",
+                &format!("ssh {} \"echo [connect-ok]\"", server_alias),
+                "failed",
+                Some(exit_code),
+                output,
+            ));
+            steps.extend(build_skipped_remote_sync_steps(
+                request.receive_id,
+                "因连接服务器失败，已跳过",
+            ));
+            return Ok(build_pdd_quick_sync_response(
+                &request,
+                &file_path,
+                old_receive_id,
+                replaced_line,
+                replaced_count,
+                commit_hash,
+                branch,
+                pushed,
+                steps,
+                "一键同步失败：连接服务器失败".to_string(),
+            ));
+        }
+        Err(err) => {
+            steps.push(build_sync_step_result(
+                "ssh-connect",
+                4,
+                "连接服务器",
+                &format!("ssh {} \"echo [connect-ok]\"", server_alias),
+                "failed",
+                None,
+                err.clone(),
+            ));
+            steps.extend(build_skipped_remote_sync_steps(
+                request.receive_id,
+                "因连接服务器失败，已跳过",
+            ));
+            return Ok(build_pdd_quick_sync_response(
+                &request,
+                &file_path,
+                old_receive_id,
+                replaced_line,
+                replaced_count,
+                commit_hash,
+                branch,
+                pushed,
+                steps,
+                format!("一键同步失败：连接服务器失败（{err}）"),
+            ));
+        }
+    }
+
+    steps.extend(run_remote_sync_steps(server_alias, request.receive_id));
+
+    let success = !steps.iter().any(|item| item.status == "failed");
+    let message = if success {
+        format!(
+            "一键同步完成：替换、提交、推送、连服与远程命令全部成功（task={}，id={}）",
+            request.task_id, request.receive_id
+        )
+    } else {
+        format!(
+            "一键同步存在失败步骤，请查看反馈详情（task={}，id={}）",
+            request.task_id, request.receive_id
+        )
+    };
+
+    Ok(build_pdd_quick_sync_response(
+        &request,
+        &file_path,
+        old_receive_id,
+        replaced_line,
+        replaced_count,
+        commit_hash,
+        branch,
+        pushed,
+        steps,
+        message,
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct ReplaceSyncResult {
+    old_receive_id: i64,
+    line_number: usize,
+}
+
+fn replace_min_sync_receive_in_task(
+    file_path: &Path,
+    task_id: i32,
+    new_receive_id: i64,
+) -> Result<ReplaceSyncResult, String> {
     if !file_path.exists() {
         return Err(format!("目标文件不存在：{}", file_path.display()));
     }
-
-    let mut source = fs::read_to_string(&file_path)
+    let mut source = fs::read_to_string(file_path)
         .map_err(|err| format!("读取目标文件失败：{} ({err})", file_path.display()))?;
-    let (block_start, block_end) = find_task_block_range(&source, request.task_id)?;
+    let (block_start, block_end) = find_task_block_range(&source, task_id)?;
     let entries = collect_sync_receive_entries_in_block(&source, block_start, block_end);
     if entries.is_empty() {
         return Err(format!(
             "task->id == {} 的代码块里没有可替换的 sync:receive 调用",
-            request.task_id
+            task_id
         ));
     }
-
     let target = entries
         .iter()
         .min_by_key(|entry| entry.receive_id)
         .cloned()
         .ok_or_else(|| "未找到可替换的 sync:receive".to_string())?;
-    source.replace_range(target.start..target.end, &request.receive_id.to_string());
-
-    fs::write(&file_path, source)
+    if target.receive_id == new_receive_id {
+        return Err(format!(
+            "task->id == {} 中最小 sync:receive 已是 {}，无需替换",
+            task_id, new_receive_id
+        ));
+    }
+    source.replace_range(target.start..target.end, &new_receive_id.to_string());
+    fs::write(file_path, source)
         .map_err(|err| format!("写入目标文件失败：{} ({err})", file_path.display()))?;
-
-    Ok(PddQuickSyncResponse {
-        success: true,
-        message: format!(
-            "已在 task->id == {} 中将最小 sync:receive {} 替换为 {}",
-            request.task_id, target.receive_id, request.receive_id
-        ),
-        file_path: file_path.display().to_string(),
-        server_alias: server_alias.to_string(),
-        task_id: request.task_id,
-        old_receive_id: Some(target.receive_id),
-        new_receive_id: request.receive_id,
-        replaced_line: Some(target.line_number),
-        replaced_count: 1,
-        updated_at: Utc::now().to_rfc3339(),
+    Ok(ReplaceSyncResult {
+        old_receive_id: target.receive_id,
+        line_number: target.line_number,
     })
+}
+
+#[derive(Debug, Clone)]
+struct GitCommitContext {
+    repo_root: PathBuf,
+    branch: String,
+    relative_text: String,
+}
+
+fn prepare_git_commit_context(file_path: &Path) -> Result<GitCommitContext, String> {
+    let file_dir = file_path
+        .parent()
+        .ok_or_else(|| format!("无法识别文件目录：{}", file_path.display()))?;
+    let repo_root_text = run_git_capture_output(
+        file_dir,
+        &["rev-parse", "--show-toplevel"],
+        "定位 Git 仓库",
+    )?;
+    let repo_root = PathBuf::from(repo_root_text.trim());
+    let branch = run_git_capture_output(
+        &repo_root,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        "读取当前分支",
+    )?;
+    let branch = branch.trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        return Err("当前处于 detached HEAD，无法自动推送".to_string());
+    }
+
+    let relative = file_path
+        .strip_prefix(&repo_root)
+        .map_err(|_| {
+            format!(
+                "目标文件不在仓库内：file={} repo={}",
+                file_path.display(),
+                repo_root.display()
+            )
+        })?
+        .to_path_buf();
+    let relative_text = relative.to_string_lossy().to_string();
+    Ok(GitCommitContext {
+        repo_root,
+        branch,
+        relative_text,
+    })
+}
+
+fn commit_single_file(
+    context: &GitCommitContext,
+    task_id: i32,
+    old_receive_id: i64,
+    new_receive_id: i64,
+) -> Result<String, String> {
+    run_git_command(
+        &context.repo_root,
+        &["add", "--", &context.relative_text],
+        "暂存目标文件",
+    )?;
+
+    let commit_message = format!(
+        "chore(sync): task {} replace sync:receive {} -> {}",
+        task_id, old_receive_id, new_receive_id
+    );
+    run_git_command(
+        &context.repo_root,
+        &["commit", "-m", &commit_message, "--", &context.relative_text],
+        "提交目标文件改动",
+    )?;
+
+    let commit_hash = run_git_capture_output(
+        &context.repo_root,
+        &["rev-parse", "--short", "HEAD"],
+        "读取提交哈希",
+    )?;
+    Ok(commit_hash.trim().to_string())
+}
+
+fn push_git_branch(context: &GitCommitContext) -> Result<(), String> {
+    run_git_command(
+        &context.repo_root,
+        &["push", "origin", &context.branch],
+        "推送到远端",
+    )
+}
+
+fn run_git_command(repo_root: &Path, args: &[&str], context: &str) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .map_err(|err| format!("{context}失败：{err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    Err(format!("{context}失败：{detail}"))
+}
+
+fn run_git_capture_output(repo_root: &Path, args: &[&str], context: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .map_err(|err| format!("{context}失败：{err}"))?;
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok(text);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    Err(format!("{context}失败：{detail}"))
+}
+
+#[derive(Debug, Clone)]
+struct RemoteSyncStepDef {
+    key: String,
+    step: usize,
+    title: String,
+    display_command: String,
+    remote_command: String,
+}
+
+fn remote_sync_step_defs(receive_id: i64) -> Vec<RemoteSyncStepDef> {
+    vec![
+        RemoteSyncStepDef {
+            key: "remote-sudo".to_string(),
+            step: 5,
+            title: "sudo -i".to_string(),
+            display_command: "sudo -i".to_string(),
+            remote_command: "sudo -i bash -lc \"echo '[step1] sudo -i ok'\"".to_string(),
+        },
+        RemoteSyncStepDef {
+            key: "remote-cd".to_string(),
+            step: 6,
+            title: "cd ~/junziyun-v7".to_string(),
+            display_command: "cd ~/junziyun-v7".to_string(),
+            remote_command: "sudo -i bash -lc \"cd ~/junziyun-v7 && pwd\"".to_string(),
+        },
+        RemoteSyncStepDef {
+            key: "remote-git-pull".to_string(),
+            step: 7,
+            title: "git pull".to_string(),
+            display_command: "git pull".to_string(),
+            remote_command: "sudo -i bash -lc \"cd ~/junziyun-v7 && git pull\"".to_string(),
+        },
+        RemoteSyncStepDef {
+            key: "remote-sync-pdd-order".to_string(),
+            step: 8,
+            title: format!("php artisan sync:pdd_order {receive_id}"),
+            display_command: format!("php artisan sync:pdd_order {receive_id}"),
+            remote_command: format!(
+                "sudo -i bash -lc \"cd ~/junziyun-v7 && php artisan sync:pdd_order {receive_id}\""
+            ),
+        },
+        RemoteSyncStepDef {
+            key: "remote-restart-cron".to_string(),
+            step: 9,
+            title: "restart cron".to_string(),
+            display_command:
+                "cd /data/wwwroot/junziyun/ && /usr/local/php/bin/php /data/wwwroot/junziyun/artisan3 start:cron restart"
+                    .to_string(),
+            remote_command:
+                "sudo -i bash -lc \"cd /data/wwwroot/junziyun/ && /usr/local/php/bin/php /data/wwwroot/junziyun/artisan3 start:cron restart\""
+                    .to_string(),
+        },
+    ]
+}
+
+fn run_remote_sync_steps(server_alias: &str, receive_id: i64) -> Vec<PddSyncStepResult> {
+    let step_defs = remote_sync_step_defs(receive_id);
+    let mut results: Vec<PddSyncStepResult> = Vec::new();
+    let mut can_continue = true;
+    for def in step_defs {
+        if !can_continue {
+            results.push(build_sync_step_result(
+                &def.key,
+                def.step,
+                &def.title,
+                &def.display_command,
+                "skipped",
+                None,
+                "因前一步失败，已跳过".to_string(),
+            ));
+            continue;
+        }
+
+        match run_ssh_command(server_alias, &def.remote_command) {
+            Ok((exit_code, output)) => {
+                if exit_code == 0 {
+                    results.push(build_sync_step_result(
+                        &def.key,
+                        def.step,
+                        &def.title,
+                        &def.display_command,
+                        "success",
+                        Some(exit_code),
+                        output,
+                    ));
+                } else {
+                    can_continue = false;
+                    results.push(build_sync_step_result(
+                        &def.key,
+                        def.step,
+                        &def.title,
+                        &def.display_command,
+                        "failed",
+                        Some(exit_code),
+                        output,
+                    ));
+                }
+            }
+            Err(err) => {
+                can_continue = false;
+                results.push(build_sync_step_result(
+                    &def.key,
+                    def.step,
+                    &def.title,
+                    &def.display_command,
+                    "failed",
+                    None,
+                    err,
+                ));
+            }
+        }
+    }
+    results
+}
+
+fn build_skipped_remote_sync_steps(receive_id: i64, reason: &str) -> Vec<PddSyncStepResult> {
+    remote_sync_step_defs(receive_id)
+        .into_iter()
+        .map(|def| {
+            build_sync_step_result(
+                &def.key,
+                def.step,
+                &def.title,
+                &def.display_command,
+                "skipped",
+                None,
+                reason.to_string(),
+            )
+        })
+        .collect::<Vec<_>>()
+}
+
+fn build_sync_step_result(
+    key: &str,
+    step: usize,
+    title: &str,
+    command: &str,
+    status: &str,
+    exit_code: Option<i32>,
+    output: String,
+) -> PddSyncStepResult {
+    PddSyncStepResult {
+        key: key.to_string(),
+        step,
+        title: title.to_string(),
+        command: command.to_string(),
+        status: status.to_string(),
+        exit_code,
+        output,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_pdd_quick_sync_response(
+    request: &PddQuickSyncRequest,
+    file_path: &Path,
+    old_receive_id: Option<i64>,
+    replaced_line: Option<usize>,
+    replaced_count: usize,
+    commit_hash: Option<String>,
+    branch: Option<String>,
+    pushed: bool,
+    steps: Vec<PddSyncStepResult>,
+    message: String,
+) -> PddQuickSyncResponse {
+    let success = !steps.iter().any(|item| item.status == "failed");
+    let remote_steps = steps
+        .iter()
+        .filter(|item| item.key.starts_with("remote-"))
+        .cloned()
+        .collect::<Vec<_>>();
+    PddQuickSyncResponse {
+        success,
+        message,
+        file_path: file_path.display().to_string(),
+        server_alias: request.server_alias.trim().to_string(),
+        task_id: request.task_id,
+        old_receive_id,
+        new_receive_id: request.receive_id,
+        replaced_line,
+        replaced_count,
+        commit_hash,
+        branch,
+        pushed,
+        steps,
+        remote_steps,
+        updated_at: Utc::now().to_rfc3339(),
+    }
+}
+
+fn run_ssh_command(server_alias: &str, remote_cmd: &str) -> Result<(i32, String), String> {
+    let output = Command::new("ssh")
+        .args(["-o", "BatchMode=yes"])
+        .args(["-o", "ConnectTimeout=20"])
+        .arg("-tt")
+        .arg(server_alias)
+        .arg(remote_cmd)
+        .output()
+        .map_err(|err| format!("执行 ssh 命令失败：{err}"))?;
+
+    let code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let merged = if stdout.is_empty() && stderr.is_empty() {
+        "<no output>".to_string()
+    } else if stdout.is_empty() {
+        stderr
+    } else if stderr.is_empty() {
+        stdout
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+    Ok((code, merged))
 }
 
 async fn sync_single_target(

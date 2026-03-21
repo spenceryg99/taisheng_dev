@@ -44,6 +44,7 @@ type StatusType = "info" | "success" | "warning" | "error";
 type ModuleKey = "aliyun" | "ssh" | "pdd";
 type SshViewMode = "enabled" | "all";
 type ThemeMode = "light" | "dark";
+type PddViewMode = "manage" | "sync";
 
 interface AccountInput {
   id: string;
@@ -169,6 +170,16 @@ interface PddQuickSyncRequest {
   receiveId: number;
 }
 
+interface PddSyncStepResult {
+  key: string;
+  step: number;
+  title: string;
+  command: string;
+  status: string;
+  exitCode?: number | null;
+  output: string;
+}
+
 interface PddQuickSyncResponse {
   success: boolean;
   message: string;
@@ -179,6 +190,11 @@ interface PddQuickSyncResponse {
   newReceiveId: number;
   replacedLine?: number | null;
   replacedCount: number;
+  commitHash?: string | null;
+  branch?: string | null;
+  pushed?: boolean;
+  steps?: PddSyncStepResult[];
+  remoteSteps?: PddSyncStepResult[];
   updatedAt: string;
 }
 
@@ -186,6 +202,9 @@ interface PddPersistedState {
   loginUrl: string;
   ocrKey: string;
   accounts: PddAccountInput[];
+  syncFilePath?: string;
+  syncTaskId?: number | null;
+  syncServerAlias?: string | null;
 }
 
 const STORAGE_KEY = "aliyun-whitelist-config-v2";
@@ -239,6 +258,23 @@ function normalizePersistedStoreMallList(primary: unknown, legacyNames: unknown)
       .map((accountName) => ({ accountName, code: "" }));
   }
   return [];
+}
+
+function buildPddSyncStepKey(step: Pick<PddSyncStepResult, "key" | "step">): string {
+  return `${step.key || "step"}-${step.step}`;
+}
+
+function pddSyncStatusLabel(status: string): string {
+  switch (status) {
+    case "success":
+      return "成功";
+    case "failed":
+      return "失败";
+    case "skipped":
+      return "跳过";
+    default:
+      return status || "未知";
+  }
 }
 
 async function copyTextToClipboard(text: string): Promise<void> {
@@ -395,11 +431,15 @@ export default function App() {
   const [pddSyncReceiveId, setPddSyncReceiveId] = useState("");
   const [pddSyncServerAlias, setPddSyncServerAlias] = useState<string | undefined>(undefined);
   const [pddSyncing, setPddSyncing] = useState(false);
-  const [pddSyncFeedback, setPddSyncFeedback] = useState("等待执行。");
+  const [pddSyncSummary, setPddSyncSummary] = useState("等待执行。");
+  const [pddSyncSteps, setPddSyncSteps] = useState<PddSyncStepResult[]>([]);
+  const [pddSyncActiveStepKey, setPddSyncActiveStepKey] = useState<string | null>(null);
+  const [pddViewMode, setPddViewMode] = useState<PddViewMode>("manage");
 
   const bootstrappedRef = useRef(false);
   const sshBootstrappedRef = useRef(false);
   const pddSshBootstrappedRef = useRef(false);
+  const pddConfigLoadedRef = useRef(false);
   const runSectionRef = useRef<HTMLDivElement | null>(null);
   const accountSectionRef = useRef<HTMLDivElement | null>(null);
   const targetSectionRef = useRef<HTMLDivElement | null>(null);
@@ -502,6 +542,33 @@ export default function App() {
       ),
     [pddAccounts]
   );
+  const pddActiveSyncStep = useMemo(() => {
+    if (pddSyncSteps.length === 0) {
+      return null;
+    }
+    if (!pddSyncActiveStepKey) {
+      return pddSyncSteps[0];
+    }
+    return (
+      pddSyncSteps.find((step) => buildPddSyncStepKey(step) === pddSyncActiveStepKey) ??
+      pddSyncSteps[0]
+    );
+  }, [pddSyncActiveStepKey, pddSyncSteps]);
+  const pddSyncDetailText = useMemo(() => {
+    if (!pddActiveSyncStep) {
+      return pddSyncSummary;
+    }
+    return [
+      pddSyncSummary,
+      "",
+      `当前步骤: Step ${pddActiveSyncStep.step} · ${pddActiveSyncStep.title}`,
+      `状态: ${pddSyncStatusLabel(pddActiveSyncStep.status)}`,
+      `命令: ${pddActiveSyncStep.command || "-"}`,
+      `退出码: ${pddActiveSyncStep.exitCode ?? "-"}`,
+      "",
+      pddActiveSyncStep.output || "<empty>",
+    ].join("\n");
+  }, [pddActiveSyncStep, pddSyncSummary]);
 
   const isDarkMode = themeMode === "dark";
 
@@ -607,6 +674,9 @@ export default function App() {
       loginUrl: nextLoginUrl.trim() || PDD_DEFAULT_LOGIN_URL,
       ocrKey: nextOcrKey,
       accounts: nextAccounts,
+      syncFilePath: pddSyncFilePath.trim(),
+      syncTaskId: pddSyncTaskId ?? null,
+      syncServerAlias: pddSyncServerAlias ?? null,
     };
     localStorage.setItem(PDD_STORAGE_KEY, JSON.stringify(payload));
     if (shouldToast) {
@@ -621,6 +691,10 @@ export default function App() {
       setPddAccounts(base);
       setPddLoginUrl(PDD_DEFAULT_LOGIN_URL);
       setPddOcrKey("");
+      setPddSyncFilePath("");
+      setPddSyncTaskId(undefined);
+      setPddSyncServerAlias(undefined);
+      pddConfigLoadedRef.current = true;
       if (shouldToast) {
         messageApi.info("已创建默认拼多多账号行");
       }
@@ -652,6 +726,18 @@ export default function App() {
       setPddAccounts(ensuredAccounts);
       setPddLoginUrl(normalizedLoginUrl);
       setPddOcrKey(parsed.ocrKey || "");
+      setPddSyncFilePath((parsed.syncFilePath || "").trim());
+      setPddSyncTaskId(
+        typeof parsed.syncTaskId === "number" && Number.isFinite(parsed.syncTaskId)
+          ? parsed.syncTaskId
+          : undefined
+      );
+      setPddSyncServerAlias(
+        parsed.syncServerAlias && parsed.syncServerAlias.trim()
+          ? parsed.syncServerAlias.trim()
+          : undefined
+      );
+      pddConfigLoadedRef.current = true;
       if (shouldToast) {
         messageApi.success("已加载拼多多配置");
       }
@@ -661,6 +747,10 @@ export default function App() {
       setPddAccounts(base);
       setPddLoginUrl(PDD_DEFAULT_LOGIN_URL);
       setPddOcrKey("");
+      setPddSyncFilePath("");
+      setPddSyncTaskId(undefined);
+      setPddSyncServerAlias(undefined);
+      pddConfigLoadedRef.current = true;
       messageApi.error(`加载拼多多配置失败: ${detail}`);
     }
   };
@@ -816,6 +906,9 @@ export default function App() {
 
     const receiveId = Number(receiveIdText);
     setPddSyncing(true);
+    setPddSyncSummary("正在执行一键同步，请稍候...");
+    setPddSyncSteps([]);
+    setPddSyncActiveStepKey(null);
     try {
       const response = await invoke<PddQuickSyncResponse>("pdd_quick_sync", {
         request: {
@@ -825,7 +918,19 @@ export default function App() {
           receiveId,
         } as PddQuickSyncRequest,
       });
-      const feedback = [
+
+      const steps = Array.isArray(response.steps)
+        ? response.steps
+        : Array.isArray(response.remoteSteps)
+          ? response.remoteSteps
+          : [];
+      setPddSyncSteps(steps);
+      if (steps.length > 0) {
+        const firstFailed = steps.find((step) => step.status === "failed");
+        setPddSyncActiveStepKey(buildPddSyncStepKey(firstFailed ?? steps[0]));
+      }
+
+      const summary = [
         response.message,
         `文件: ${response.filePath}`,
         `服务器: ${response.serverAlias}`,
@@ -833,13 +938,31 @@ export default function App() {
         `替换: ${response.oldReceiveId ?? "-"} -> ${response.newReceiveId}`,
         `行号: ${response.replacedLine ?? "-"}`,
         `替换数量: ${response.replacedCount}`,
+        `提交: ${response.commitHash || "-"}`,
+        `分支: ${response.branch || "-"}`,
+        `推送: ${response.pushed ? "已推送" : "未推送"}`,
         `时间: ${response.updatedAt}`,
       ].join("\n");
-      setPddSyncFeedback(feedback);
-      messageApi.success("一键同步完成");
+      setPddSyncSummary(summary);
+      if (response.success) {
+        messageApi.success("一键同步完成");
+      } else {
+        messageApi.warning("一键同步存在失败步骤，请查看结果反馈");
+      }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      setPddSyncFeedback(`一键同步失败: ${detail}`);
+      const failedStep: PddSyncStepResult = {
+        key: "invoke",
+        step: 1,
+        title: "调用后端",
+        command: "pdd_quick_sync",
+        status: "failed",
+        exitCode: null,
+        output: detail,
+      };
+      setPddSyncSummary(`一键同步失败: ${detail}`);
+      setPddSyncSteps([failedStep]);
+      setPddSyncActiveStepKey(buildPddSyncStepKey(failedStep));
       messageApi.error(`一键同步失败: ${detail}`);
     } finally {
       setPddSyncing(false);
@@ -983,6 +1106,14 @@ export default function App() {
       return pddSyncServerOptions.some((item) => item.value === prev) ? prev : undefined;
     });
   }, [pddSyncServerOptions]);
+
+  useEffect(() => {
+    if (!pddConfigLoadedRef.current) {
+      return;
+    }
+    persistPddConfig(pddAccounts, pddLoginUrl, pddOcrKey, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pddSyncFilePath, pddSyncTaskId, pddSyncServerAlias]);
 
   useEffect(() => {
     setPddExpandedAccountIds((prev) =>
@@ -1961,10 +2092,21 @@ export default function App() {
             </div>
           </div>
           <div className="topbar-right">
-            <Space wrap className="topbar-actions">
-              <Button size="small" icon={<PlusOutlined />} onClick={addPddAccount}>
-                新增账号
-              </Button>
+            <Space wrap className="topbar-actions pdd-topbar-actions">
+              <Segmented
+                className="pdd-view-switch"
+                value={pddViewMode}
+                options={[
+                  { label: "账号管理", value: "manage" },
+                  { label: "一键同步", value: "sync" },
+                ]}
+                onChange={(value) => setPddViewMode(value as PddViewMode)}
+              />
+              {pddViewMode === "manage" ? (
+                <Button size="small" icon={<PlusOutlined />} onClick={addPddAccount}>
+                  新增账号
+                </Button>
+              ) : null}
               <Button
                 size="small"
                 icon={<SaveOutlined />}
@@ -1988,168 +2130,197 @@ export default function App() {
         </div>
       </Card>
 
-      <div className="stat-row">
-        <div className="stat-card stat-card-ip">账号 {pddAccounts.length}</div>
-        <div className="stat-card stat-card-account">已填应用ID {pddFilledAppIdCount}</div>
-        <div className="stat-card stat-card-rule">店铺 {pddTotalStoreCount}（未填ID {pddMissingAppIdCount}）</div>
-      </div>
-
-      <Card className="section-card" bordered={false}>
-        <Typography.Title level={4} className="section-block-title">
-          一键同步
-        </Typography.Title>
-        <div className="pdd-sync-row">
-          <Space.Compact block className="pdd-sync-file-picker">
-            <Input
-              value={pddSyncFilePath}
-              onChange={(event) => setPddSyncFilePath(event.target.value)}
-              placeholder="请选择或输入文件路径"
-              addonBefore="文件"
-            />
-            <Button onClick={() => void choosePddSyncFile()}>选择文件</Button>
-          </Space.Compact>
-          <Select
-            value={pddSyncTaskId}
-            options={PDD_SYNC_TASK_OPTIONS}
-            onChange={(value) => setPddSyncTaskId(value)}
-            allowClear
-            placeholder="选择类型（按 task id 匹配）"
-            className="pdd-sync-type-select"
-          />
-          <Input
-            value={pddSyncReceiveId}
-            onChange={(event) => setPddSyncReceiveId(event.target.value.replace(/[^\d]/g, ""))}
-            placeholder="输入要替换的新ID"
-            addonBefore="替换ID"
-          />
-          <Select
-            value={pddSyncServerAlias}
-            options={pddSyncServerOptions}
-            onChange={(value) => setPddSyncServerAlias(value)}
-            allowClear
-            showSearch
-            optionFilterProp="label"
-            placeholder="选择服务器（仅显示未隐藏快捷连接）"
-            className="pdd-sync-server-select"
-            notFoundContent="暂无可用服务器，请先到快捷连接中设置为显示"
-          />
-          <Button
-            type="primary"
-            className="pdd-sync-action-btn"
-            loading={pddSyncing}
-            onClick={() => void triggerPddQuickSync()}
-          >
+      {pddViewMode === "sync" ? (
+        <Card className="section-card" bordered={false}>
+          <Typography.Title level={4} className="section-block-title">
             一键同步
-          </Button>
-        </div>
-        <div className="pdd-sync-feedback-block">
-          <Typography.Text strong className="pdd-sync-feedback-title">
-            结果反馈
-          </Typography.Text>
-          <Input.TextArea
-            value={pddSyncFeedback}
-            readOnly
-            autoSize={{ minRows: 3, maxRows: 6 }}
-            placeholder="执行结果会在这里显示"
-          />
-        </div>
-      </Card>
-
-      <Card className="section-card" bordered={false}>
-        <Collapse
-          className="pdd-login-collapse"
-          ghost
-          defaultActiveKey={[]}
-          expandIconPosition="end"
-          items={[
-            {
-              key: "pdd-login-settings",
-              label: "登录设置",
-              children: (
-                <div className="pdd-login-collapse-body">
-                  <Typography.Paragraph type="secondary" className="section-help">
-                    按完整链路执行：自动登录、自动滑块（失败可人工），成功后直接进入授权管理详情页并抓取 page 请求数据。
-                  </Typography.Paragraph>
-                  <Input
-                    className="run-inline-input"
-                    value={pddLoginUrl}
-                    onChange={(event) => setPddLoginUrl(event.target.value)}
-                    placeholder="拼多多登录地址，例如 https://open.pinduoduo.com/application/home"
-                    addonBefore="登录地址"
-                  />
-                  <Input.Password
-                    className="run-inline-input"
-                    value={pddOcrKey}
-                    onChange={(event) => setPddOcrKey(event.target.value)}
-                    placeholder="滑块解密 K（留空则仅人工滑块）"
-                    addonBefore="解密 K"
-                  />
-                </div>
-              ),
-            },
-          ]}
-        />
-      </Card>
-
-      <Card className="section-card" bordered={false}>
-        <Typography.Title level={4} className="section-block-title">
-          账号列表
-        </Typography.Title>
-        <Table<PddAccountInput>
-          className="modern-table pdd-account-table"
-          rowKey="id"
-          columns={pddColumns}
-          dataSource={pddAccounts}
-          expandable={{
-            columnWidth: 110,
-            expandedRowKeys: pddExpandedAccountIds,
-            onExpandedRowsChange: (keys) =>
-              setPddExpandedAccountIds(keys.map((key) => String(key))),
-            rowExpandable: (record) =>
-              Array.isArray(record.storeMallList) && record.storeMallList.length > 0,
-            expandIcon: ({ expanded, onExpand, record, expandable }) =>
-              expandable ? (
-                <Button
-                  size="small"
-                  className="pdd-expand-trigger"
-                  icon={expanded ? <DownOutlined /> : <RightOutlined />}
-                  onClick={(event) => onExpand(record, event)}
-                >
-                  {expanded ? "收起" : "展开"}
-                </Button>
-              ) : (
-                <span className="pdd-expand-placeholder">-</span>
-              ),
-            expandedRowRender: (record) => (
-              <Table<PddStoreItem>
-                className="pdd-store-table"
-                size="small"
-                rowKey={(row, index) => `${record.id}-${row.accountName}-${row.code}-${index}`}
-                columns={pddStoreColumns}
-                dataSource={record.storeMallList}
-                pagination={false}
-                tableLayout="fixed"
-                locale={{ emptyText: "暂无店铺数据" }}
+          </Typography.Title>
+          <div className="pdd-sync-row">
+            <Space.Compact block className="pdd-sync-file-picker">
+              <Input
+                value={pddSyncFilePath}
+                onChange={(event) => setPddSyncFilePath(event.target.value)}
+                placeholder="请选择或输入文件路径"
+                addonBefore="文件"
               />
-            ),
-          }}
-          size="small"
-          pagination={{ pageSize: 6, showSizeChanger: false }}
-          tableLayout="fixed"
-          locale={{ emptyText: "暂无账号，请点击“新增账号”" }}
-        />
-      </Card>
+              <Button onClick={() => void choosePddSyncFile()}>选择文件</Button>
+            </Space.Compact>
+            <Select
+              value={pddSyncTaskId}
+              options={PDD_SYNC_TASK_OPTIONS}
+              onChange={(value) => setPddSyncTaskId(value)}
+              allowClear
+              placeholder="选择类型（按 task id 匹配）"
+              className="pdd-sync-type-select"
+            />
+            <Input
+              value={pddSyncReceiveId}
+              onChange={(event) => setPddSyncReceiveId(event.target.value.replace(/[^\d]/g, ""))}
+              placeholder="输入要替换的新ID"
+              addonBefore="替换ID"
+            />
+            <Select
+              value={pddSyncServerAlias}
+              options={pddSyncServerOptions}
+              onChange={(value) => setPddSyncServerAlias(value)}
+              allowClear
+              showSearch
+              optionFilterProp="label"
+              placeholder="选择服务器（仅显示未隐藏快捷连接）"
+              className="pdd-sync-server-select"
+              notFoundContent="暂无可用服务器，请先到快捷连接中设置为显示"
+            />
+            <Button
+              type="primary"
+              className="pdd-sync-action-btn"
+              loading={pddSyncing}
+              onClick={() => void triggerPddQuickSync()}
+            >
+              一键同步
+            </Button>
+          </div>
+          <div className="pdd-sync-feedback-block">
+            <Typography.Text strong className="pdd-sync-feedback-title">
+              结果反馈
+            </Typography.Text>
+            <div className="pdd-sync-step-tag-row">
+              {pddSyncSteps.length > 0 ? (
+                pddSyncSteps.map((step) => {
+                  const stepKey = buildPddSyncStepKey(step);
+                  return (
+                    <Tag
+                      key={stepKey}
+                      className={[
+                        "pdd-sync-step-tag",
+                        `is-${step.status || "unknown"}`,
+                        pddSyncActiveStepKey === stepKey ? "active" : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" ")}
+                      onClick={() => setPddSyncActiveStepKey(stepKey)}
+                    >
+                      {`Step ${step.step} ${step.title} · ${pddSyncStatusLabel(step.status)}`}
+                    </Tag>
+                  );
+                })
+              ) : (
+                <Tag className="pdd-sync-step-tag is-idle">等待执行</Tag>
+              )}
+            </div>
+            <Input.TextArea
+              value={pddSyncDetailText}
+              readOnly
+              autoSize={{ minRows: 10, maxRows: 18 }}
+              className="pdd-sync-feedback-textarea"
+              placeholder="每一步的执行结果会显示在这里"
+            />
+          </div>
+        </Card>
+      ) : (
+        <>
+          <div className="stat-row">
+            <div className="stat-card stat-card-ip">账号 {pddAccounts.length}</div>
+            <div className="stat-card stat-card-account">已填应用ID {pddFilledAppIdCount}</div>
+            <div className="stat-card stat-card-rule">店铺 {pddTotalStoreCount}（未填ID {pddMissingAppIdCount}）</div>
+          </div>
 
-      <Card className="section-card" bordered={false}>
-        <Typography.Title level={4} className="section-block-title">
-          店铺列表说明
-        </Typography.Title>
-        <Typography.Paragraph type="secondary" className="section-help">
-          点击账号行的“登录”后，程序会自动进入对应应用详情页并监听
-          https://open-api.pinduoduo.com/pop/application/white/owner/page，
-          返回中的 ownerMallList（兼容 ownerMallNameList）会解析为“账户名 + 编号”，并保存到该账号的店铺子列表。
-        </Typography.Paragraph>
-      </Card>
+          <Card className="section-card" bordered={false}>
+            <Collapse
+              className="pdd-login-collapse"
+              ghost
+              defaultActiveKey={[]}
+              expandIconPosition="end"
+              items={[
+                {
+                  key: "pdd-login-settings",
+                  label: "登录设置",
+                  children: (
+                    <div className="pdd-login-collapse-body">
+                      <Typography.Paragraph type="secondary" className="section-help">
+                        按完整链路执行：自动登录、自动滑块（失败可人工），成功后直接进入授权管理详情页并抓取 page 请求数据。
+                      </Typography.Paragraph>
+                      <Input
+                        className="run-inline-input"
+                        value={pddLoginUrl}
+                        onChange={(event) => setPddLoginUrl(event.target.value)}
+                        placeholder="拼多多登录地址，例如 https://open.pinduoduo.com/application/home"
+                        addonBefore="登录地址"
+                      />
+                      <Input.Password
+                        className="run-inline-input"
+                        value={pddOcrKey}
+                        onChange={(event) => setPddOcrKey(event.target.value)}
+                        placeholder="滑块解密 K（留空则仅人工滑块）"
+                        addonBefore="解密 K"
+                      />
+                    </div>
+                  ),
+                },
+              ]}
+            />
+          </Card>
+
+          <Card className="section-card" bordered={false}>
+            <Typography.Title level={4} className="section-block-title">
+              账号列表
+            </Typography.Title>
+            <Table<PddAccountInput>
+              className="modern-table pdd-account-table"
+              rowKey="id"
+              columns={pddColumns}
+              dataSource={pddAccounts}
+              expandable={{
+                columnWidth: 110,
+                expandedRowKeys: pddExpandedAccountIds,
+                onExpandedRowsChange: (keys) =>
+                  setPddExpandedAccountIds(keys.map((key) => String(key))),
+                rowExpandable: (record) =>
+                  Array.isArray(record.storeMallList) && record.storeMallList.length > 0,
+                expandIcon: ({ expanded, onExpand, record, expandable }) =>
+                  expandable ? (
+                    <Button
+                      size="small"
+                      className="pdd-expand-trigger"
+                      icon={expanded ? <DownOutlined /> : <RightOutlined />}
+                      onClick={(event) => onExpand(record, event)}
+                    >
+                      {expanded ? "收起" : "展开"}
+                    </Button>
+                  ) : (
+                    <span className="pdd-expand-placeholder">-</span>
+                  ),
+                expandedRowRender: (record) => (
+                  <Table<PddStoreItem>
+                    className="pdd-store-table"
+                    size="small"
+                    rowKey={(row, index) => `${record.id}-${row.accountName}-${row.code}-${index}`}
+                    columns={pddStoreColumns}
+                    dataSource={record.storeMallList}
+                    pagination={false}
+                    tableLayout="fixed"
+                    locale={{ emptyText: "暂无店铺数据" }}
+                  />
+                ),
+              }}
+              size="small"
+              pagination={{ pageSize: 6, showSizeChanger: false }}
+              tableLayout="fixed"
+              locale={{ emptyText: "暂无账号，请点击“新增账号”" }}
+            />
+          </Card>
+
+          <Card className="section-card" bordered={false}>
+            <Typography.Title level={4} className="section-block-title">
+              店铺列表说明
+            </Typography.Title>
+            <Typography.Paragraph type="secondary" className="section-help">
+              点击账号行的“登录”后，程序会自动进入对应应用详情页并监听
+              https://open-api.pinduoduo.com/pop/application/white/owner/page，
+              返回中的 ownerMallList（兼容 ownerMallNameList）会解析为“账户名 + 编号”，并保存到该账号的店铺子列表。
+            </Typography.Paragraph>
+          </Card>
+        </>
+      )}
     </div>
   );
 
