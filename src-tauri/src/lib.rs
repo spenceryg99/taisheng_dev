@@ -132,6 +132,16 @@ struct SshShortcutRow {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshConnectionTestResult {
+    alias: String,
+    status: String,
+    exit_code: Option<i32>,
+    output: String,
+    checked_at: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PddLoginRequest {
@@ -639,6 +649,32 @@ async fn sync_all(request: SyncRequest) -> Result<SyncResponse, String> {
 
 #[tauri::command]
 fn list_ssh_shortcuts() -> Result<Vec<SshShortcutRow>, String> {
+    list_ssh_shortcuts_internal()
+}
+
+#[tauri::command]
+fn test_ssh_shortcut(alias: String) -> Result<SshConnectionTestResult, String> {
+    let alias = validate_alias(&alias)?;
+    Ok(run_ssh_connection_test(alias))
+}
+
+#[tauri::command]
+fn test_all_ssh_shortcuts() -> Result<Vec<SshConnectionTestResult>, String> {
+    let rows = list_ssh_shortcuts_internal()?;
+    let results = rows
+        .into_iter()
+        .map(|row| run_ssh_connection_test(&row.alias))
+        .collect::<Vec<_>>();
+    Ok(results)
+}
+
+#[tauri::command]
+fn delete_ssh_shortcut(alias: String) -> Result<String, String> {
+    let alias = validate_alias(&alias)?;
+    delete_ssh_alias_from_config(alias)
+}
+
+fn list_ssh_shortcuts_internal() -> Result<Vec<SshShortcutRow>, String> {
     let home_dir = home_dir_path()?;
     let config_path = home_dir.join(".ssh").join("config");
     if !config_path.exists() {
@@ -1551,6 +1587,7 @@ fn run_ssh_command(server_alias: &str, remote_cmd: &str) -> Result<(i32, String)
         .args(["-o", "BatchMode=yes"])
         .args(["-o", "ConnectTimeout=20"])
         .arg("-tt")
+        .arg("--")
         .arg(server_alias)
         .arg(remote_cmd)
         .output()
@@ -2520,19 +2557,172 @@ fn validate_alias(alias: &str) -> Result<&str, String> {
         return Err("SSH 别名不能为空".to_string());
     }
 
-    if !trimmed
+    if trimmed
         .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '@' | ':'))
+        .any(|ch| ch == '\0' || ch == '\n' || ch == '\r')
     {
-        return Err("SSH 别名包含非法字符，仅允许字母数字和 . _ - @ :".to_string());
+        return Err("SSH 别名包含非法字符（不允许换行或空字符）".to_string());
     }
 
     Ok(trimmed)
 }
 
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn run_ssh_connection_test(alias: &str) -> SshConnectionTestResult {
+    let output = Command::new("ssh")
+        .args(["-o", "BatchMode=yes"])
+        .args(["-o", "ConnectTimeout=8"])
+        .args(["-o", "ConnectionAttempts=1"])
+        .args(["-o", "NumberOfPasswordPrompts=0"])
+        .args(["-o", "StrictHostKeyChecking=accept-new"])
+        .arg("--")
+        .arg(alias)
+        .arg("echo __SP_SSH_TEST_OK__")
+        .output();
+
+    let checked_at = Utc::now().to_rfc3339();
+    match output {
+        Ok(output) => {
+            let exit_code = output.status.code();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let merged = if stdout.is_empty() && stderr.is_empty() {
+                "<no output>".to_string()
+            } else if stdout.is_empty() {
+                stderr
+            } else if stderr.is_empty() {
+                stdout
+            } else {
+                format!("{stdout}\n{stderr}")
+            };
+
+            let success = output.status.success() && merged.contains("__SP_SSH_TEST_OK__");
+            SshConnectionTestResult {
+                alias: alias.to_string(),
+                status: if success {
+                    "success".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                exit_code,
+                output: if success {
+                    merged.replace("__SP_SSH_TEST_OK__", "连接测试成功")
+                } else {
+                    merged
+                },
+                checked_at,
+            }
+        }
+        Err(err) => SshConnectionTestResult {
+            alias: alias.to_string(),
+            status: "failed".to_string(),
+            exit_code: None,
+            output: format!("执行 ssh 测试失败：{err}"),
+            checked_at,
+        },
+    }
+}
+
+fn load_ssh_alias_sources() -> Result<BTreeMap<String, SshAliasSource>, String> {
+    let home_dir = home_dir_path()?;
+    let config_path = home_dir.join(".ssh").join("config");
+    if !config_path.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut visited_files: HashSet<PathBuf> = HashSet::new();
+    let mut aliases: BTreeMap<String, SshAliasSource> = BTreeMap::new();
+    collect_ssh_aliases_from_file(&config_path, &home_dir, &mut visited_files, &mut aliases)?;
+    Ok(aliases)
+}
+
+fn delete_ssh_alias_from_config(alias: &str) -> Result<String, String> {
+    let alias_sources = load_ssh_alias_sources()?;
+    let source = alias_sources
+        .get(alias)
+        .ok_or_else(|| format!("未找到 SSH 快捷连接：{alias}"))?;
+    let source_path = PathBuf::from(&source.source_file);
+    if !source_path.exists() {
+        return Err(format!("配置文件不存在：{}", source_path.display()));
+    }
+
+    let content = fs::read_to_string(&source_path)
+        .map_err(|err| format!("读取 SSH 配置失败：{} ({err})", source_path.display()))?;
+    let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let had_trailing_newline = content.ends_with('\n');
+    let mut lines = content.lines().map(ToString::to_string).collect::<Vec<_>>();
+
+    let removed_line_count = remove_ssh_alias_from_lines(&mut lines, alias)?;
+    let mut next_content = lines.join(line_ending);
+    if had_trailing_newline && !next_content.is_empty() {
+        next_content.push_str(line_ending);
+    }
+    fs::write(&source_path, next_content)
+        .map_err(|err| format!("写入 SSH 配置失败：{} ({err})", source_path.display()))?;
+
+    Ok(format!(
+        "已删除 SSH 快捷连接 {}（{}，移除 {} 行）",
+        alias,
+        source_path.display(),
+        removed_line_count
+    ))
+}
+
+fn remove_ssh_alias_from_lines(lines: &mut Vec<String>, alias: &str) -> Result<usize, String> {
+    for idx in 0..lines.len() {
+        let tokens = parse_ssh_line_tokens(&lines[idx]);
+        if tokens.len() < 2 {
+            continue;
+        }
+        if !tokens[0].eq_ignore_ascii_case("host") {
+            continue;
+        }
+
+        if !tokens.iter().skip(1).any(|token| token == alias) {
+            continue;
+        }
+
+        let mut block_end = idx + 1;
+        while block_end < lines.len() {
+            let next_tokens = parse_ssh_line_tokens(&lines[block_end]);
+            if !next_tokens.is_empty() {
+                let key = next_tokens[0].to_ascii_lowercase();
+                if key == "host" || key == "match" {
+                    break;
+                }
+            }
+            block_end += 1;
+        }
+
+        let remaining = tokens
+            .iter()
+            .skip(1)
+            .filter(|token| token.as_str() != alias)
+            .cloned()
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            let removed = block_end.saturating_sub(idx);
+            lines.drain(idx..block_end);
+            return Ok(removed);
+        }
+
+        let indent = lines[idx]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .collect::<String>();
+        lines[idx] = format!("{indent}Host {}", remaining.join(" "));
+        return Ok(1);
+    }
+
+    Err(format!("未在 SSH 配置中找到别名 {alias}"))
+}
+
 #[cfg(target_os = "macos")]
 fn open_ssh_terminal_macos(alias: &str) -> Result<(), String> {
-    let command = format!("ssh {}", alias);
+    let command = format!("ssh -- {}", shell_single_quote(alias));
     let escaped_command = command.replace('\\', "\\\\").replace('"', "\\\"");
     let status = Command::new("osascript")
         .arg("-e")
@@ -2553,7 +2743,8 @@ fn open_ssh_terminal_macos(alias: &str) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn open_ssh_terminal_windows(alias: &str) -> Result<(), String> {
-    let ssh_command = format!("ssh {}", alias);
+    let escaped = alias.replace('"', "\\\"");
+    let ssh_command = format!("ssh -- \"{}\"", escaped);
     let status = Command::new("cmd")
         .args(["/C", "start", "", "cmd", "/K", &ssh_command])
         .status()
@@ -2568,9 +2759,9 @@ fn open_ssh_terminal_windows(alias: &str) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn open_ssh_terminal_linux(alias: &str) -> Result<(), String> {
     let launchers: [(&str, Vec<&str>); 3] = [
-        ("x-terminal-emulator", vec!["-e", "ssh", alias]),
-        ("gnome-terminal", vec!["--", "ssh", alias]),
-        ("konsole", vec!["-e", "ssh", alias]),
+        ("x-terminal-emulator", vec!["-e", "ssh", "--", alias]),
+        ("gnome-terminal", vec!["--", "ssh", "--", alias]),
+        ("konsole", vec!["-e", "ssh", "--", alias]),
     ];
 
     for (bin, args) in launchers {
@@ -4482,6 +4673,9 @@ pub fn run() {
             sync_all,
             list_ssh_shortcuts,
             open_ssh_terminal,
+            test_ssh_shortcut,
+            test_all_ssh_shortcuts,
+            delete_ssh_shortcut,
             pdd_login_with_browser,
             pdd_validate_cookie,
             pdd_fetch_store_configs,

@@ -518,6 +518,12 @@ body {
   color: #ffffff !important;
 }
 
+.topbar-btn.topbar-btn-ssh-test {
+  border-color: #1d4ed8 !important;
+  background: #dbeafe !important;
+  color: #1e3a8a !important;
+}
+
 .toolbar-divider {
   width: 1px;
   height: 14px;
@@ -836,6 +842,12 @@ body {
 .ssh-metric-chip-hidden {
   border-color: #b7efd0;
   background: #ecfdf5;
+}
+
+.ssh-metric-chip-tested {
+  border-color: #f8d2aa;
+  background: #fff7ed;
+  color: #9a3412;
 }
 
 .ssh-toggle-row {
@@ -1384,6 +1396,7 @@ body {
 .detail-item b {
   color: #10203b;
   font-weight: 620;
+  word-break: break-all;
 }
 
 .app-layout.theme-dark {
@@ -1699,6 +1712,12 @@ body {
   color: #ffffff !important;
 }
 
+.app-layout.theme-dark .topbar-btn.topbar-btn-ssh-test {
+  border-color: #2e5b97 !important;
+  background: #102a4c !important;
+  color: #93c5fd !important;
+}
+
 .app-layout.theme-dark .topbar-btn.topbar-btn-ssh-reset {
   border-color: #2e5b97 !important;
   background: #102a4c !important;
@@ -1760,6 +1779,12 @@ body {
 .app-layout.theme-dark .ssh-metric-chip-hidden {
   border-color: #1c6b57;
   background: #0f2e28;
+}
+
+.app-layout.theme-dark .ssh-metric-chip-tested {
+  border-color: #9a3412;
+  background: #3a1f0f;
+  color: #fdba74;
 }
 
 .app-layout.theme-dark .ssh-toggle-row .ant-btn {
