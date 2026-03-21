@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   Button,
   Card,
+  Collapse,
   ConfigProvider,
   Input,
   Layout,
@@ -19,8 +21,10 @@ import {
 import { Theme } from "@radix-ui/themes";
 import type { ColumnsType } from "antd/es/table";
 import {
+  CopyOutlined,
   CloudSyncOutlined,
   DeleteOutlined,
+  DownOutlined,
   DownloadOutlined,
   EyeInvisibleOutlined,
   EyeOutlined,
@@ -28,14 +32,16 @@ import {
   MoonOutlined,
   PlusOutlined,
   ReloadOutlined,
+  RightOutlined,
   SaveOutlined,
   SafetyCertificateOutlined,
+  ShopOutlined,
   SunOutlined,
 } from "@ant-design/icons";
 
 type Nullable<T> = T | null;
 type StatusType = "info" | "success" | "warning" | "error";
-type ModuleKey = "aliyun" | "ssh";
+type ModuleKey = "aliyun" | "ssh" | "pdd";
 type SshViewMode = "enabled" | "all";
 type ThemeMode = "light" | "dark";
 
@@ -116,9 +122,83 @@ interface SshShortcutRow {
   error?: string | null;
 }
 
+interface PddStoreItem {
+  accountName: string;
+  code: string;
+}
+
+interface PddAccountInput {
+  id: string;
+  name: string;
+  account: string;
+  password: string;
+  appId: string;
+  storeMallList: PddStoreItem[];
+  cookiePath: Nullable<string>;
+  cookieStatus: "unknown" | "valid" | "invalid";
+  cookieCheckedAt: Nullable<string>;
+  cookieReason: Nullable<string>;
+}
+
+interface PddLoginRequest {
+  name: string;
+  account: string;
+  password: string;
+  loginUrl: string;
+  appId: string;
+  cookiePath: Nullable<string>;
+  ocrKey?: Nullable<string>;
+}
+
+interface PddLoginResponse {
+  cookiePath: string;
+  cookieCount: number;
+  savedAt: string;
+  message: string;
+  loginUrl: string;
+  account: string;
+  ownerMallList?: PddStoreItem[];
+  ownerMallNameList?: string[];
+  capturePath?: string | null;
+}
+
+interface PddQuickSyncRequest {
+  filePath: string;
+  serverAlias: string;
+  taskId: number;
+  receiveId: number;
+}
+
+interface PddQuickSyncResponse {
+  success: boolean;
+  message: string;
+  filePath: string;
+  serverAlias: string;
+  taskId: number;
+  oldReceiveId?: number | null;
+  newReceiveId: number;
+  replacedLine?: number | null;
+  replacedCount: number;
+  updatedAt: string;
+}
+
+interface PddPersistedState {
+  loginUrl: string;
+  ocrKey: string;
+  accounts: PddAccountInput[];
+}
+
 const STORAGE_KEY = "aliyun-whitelist-config-v2";
 const SSH_HIDDEN_STORAGE_KEY = "ssh-hidden-aliases-v1";
 const THEME_MODE_STORAGE_KEY = "desktop-theme-mode-v2";
+const PDD_STORAGE_KEY = "pdd-open-platform-manager-v1";
+const PDD_DEFAULT_LOGIN_URL = "https://open.pinduoduo.com/application/home";
+const PDD_LEGACY_LOGIN_URL = "https://mms.pinduoduo.com/login/";
+const PDD_SYNC_TASK_OPTIONS: { label: string; value: number }[] = [
+  { label: "泰盛卡行（task 0）", value: 0 },
+  { label: "手机号卡订单管理（task 1）", value: 1 },
+  { label: "爱宇订单导出（task 2）", value: 2 },
+];
 
 function uid(prefix: string): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -133,6 +213,56 @@ function normalizeNullable(value: Nullable<string>): Nullable<string> {
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeStoreItem(value: unknown): PddStoreItem | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const maybe = value as { accountName?: unknown; code?: unknown };
+  const accountName = String(maybe.accountName ?? "").trim();
+  const code = String(maybe.code ?? "").trim();
+  if (!accountName) {
+    return null;
+  }
+  return { accountName, code };
+}
+
+function normalizePersistedStoreMallList(primary: unknown, legacyNames: unknown): PddStoreItem[] {
+  if (Array.isArray(primary)) {
+    return primary.map((item) => normalizeStoreItem(item)).filter((item): item is PddStoreItem => item !== null);
+  }
+  if (Array.isArray(legacyNames)) {
+    return legacyNames
+      .map((name) => String(name).trim())
+      .filter((name) => name.length > 0)
+      .map((accountName) => ({ accountName, code: "" }));
+  }
+  return [];
+}
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  if (typeof document === "undefined") {
+    throw new Error("当前环境不支持复制");
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "readonly");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  document.body.removeChild(textarea);
+  if (!copied) {
+    throw new Error("浏览器拒绝复制");
+  }
 }
 
 function blankAccount(): AccountInput {
@@ -155,6 +285,21 @@ function blankTarget(accountId: string): TargetInput {
     regionId: null,
     ruleId: null,
     description: null,
+  };
+}
+
+function blankPddAccount(): PddAccountInput {
+  return {
+    id: uid("pdd"),
+    name: "",
+    account: "",
+    password: "",
+    appId: "",
+    storeMallList: [],
+    cookiePath: null,
+    cookieStatus: "unknown",
+    cookieCheckedAt: null,
+    cookieReason: null,
   };
 }
 
@@ -240,8 +385,21 @@ export default function App() {
   const [showTargetEditor, setShowTargetEditor] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
 
+  const [pddLoginUrl, setPddLoginUrl] = useState(PDD_DEFAULT_LOGIN_URL);
+  const [pddOcrKey, setPddOcrKey] = useState("");
+  const [pddAccounts, setPddAccounts] = useState<PddAccountInput[]>([]);
+  const [pddLoggingInAccountId, setPddLoggingInAccountId] = useState<string | null>(null);
+  const [pddExpandedAccountIds, setPddExpandedAccountIds] = useState<string[]>([]);
+  const [pddSyncFilePath, setPddSyncFilePath] = useState("");
+  const [pddSyncTaskId, setPddSyncTaskId] = useState<number | undefined>(undefined);
+  const [pddSyncReceiveId, setPddSyncReceiveId] = useState("");
+  const [pddSyncServerAlias, setPddSyncServerAlias] = useState<string | undefined>(undefined);
+  const [pddSyncing, setPddSyncing] = useState(false);
+  const [pddSyncFeedback, setPddSyncFeedback] = useState("等待执行。");
+
   const bootstrappedRef = useRef(false);
   const sshBootstrappedRef = useRef(false);
+  const pddSshBootstrappedRef = useRef(false);
   const runSectionRef = useRef<HTMLDivElement | null>(null);
   const accountSectionRef = useRef<HTMLDivElement | null>(null);
   const targetSectionRef = useRef<HTMLDivElement | null>(null);
@@ -309,6 +467,40 @@ export default function App() {
   const firstHiddenAlias = useMemo(
     () => sshShortcuts.find((row) => hiddenAliasSet.has(row.alias))?.alias ?? null,
     [hiddenAliasSet, sshShortcuts]
+  );
+  const pddSyncServerOptions = useMemo(
+    () =>
+      sshShortcuts
+        .filter((row) => !hiddenAliasSet.has(row.alias))
+        .map((row) => {
+          const hostText = row.hostName?.trim();
+          const userText = row.user?.trim();
+          const portText = row.port?.trim();
+          const detail = hostText
+            ? `${userText ? `${userText}@` : ""}${hostText}${portText ? `:${portText}` : ""}`
+            : "";
+          return {
+            label: detail ? `${row.alias} (${detail})` : row.alias,
+            value: row.alias,
+          };
+        }),
+    [hiddenAliasSet, sshShortcuts]
+  );
+  const pddFilledAppIdCount = useMemo(
+    () => pddAccounts.filter((item) => item.appId.trim().length > 0).length,
+    [pddAccounts]
+  );
+  const pddMissingAppIdCount = useMemo(
+    () => pddAccounts.filter((item) => item.appId.trim().length === 0).length,
+    [pddAccounts]
+  );
+  const pddTotalStoreCount = useMemo(
+    () =>
+      pddAccounts.reduce(
+        (total, item) => total + (Array.isArray(item.storeMallList) ? item.storeMallList.length : 0),
+        0
+      ),
+    [pddAccounts]
   );
 
   const isDarkMode = themeMode === "dark";
@@ -405,6 +597,255 @@ export default function App() {
     }
   };
 
+  const persistPddConfig = (
+    nextAccounts: PddAccountInput[] = pddAccounts,
+    nextLoginUrl = pddLoginUrl,
+    nextOcrKey = pddOcrKey,
+    shouldToast = true
+  ): void => {
+    const payload: PddPersistedState = {
+      loginUrl: nextLoginUrl.trim() || PDD_DEFAULT_LOGIN_URL,
+      ocrKey: nextOcrKey,
+      accounts: nextAccounts,
+    };
+    localStorage.setItem(PDD_STORAGE_KEY, JSON.stringify(payload));
+    if (shouldToast) {
+      messageApi.success("拼多多配置已保存");
+    }
+  };
+
+  const loadPddConfig = (shouldToast = true): void => {
+    const raw = localStorage.getItem(PDD_STORAGE_KEY);
+    if (!raw) {
+      const base = [blankPddAccount()];
+      setPddAccounts(base);
+      setPddLoginUrl(PDD_DEFAULT_LOGIN_URL);
+      setPddOcrKey("");
+      if (shouldToast) {
+        messageApi.info("已创建默认拼多多账号行");
+      }
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as PddPersistedState;
+      const loadedLoginUrl = parsed.loginUrl?.trim() || "";
+      const normalizedLoginUrl =
+        !loadedLoginUrl || loadedLoginUrl === PDD_LEGACY_LOGIN_URL
+          ? PDD_DEFAULT_LOGIN_URL
+          : loadedLoginUrl;
+      const accountsLoaded = (parsed.accounts ?? []).map((item) => ({
+        ...blankPddAccount(),
+        ...item,
+        id: item.id || uid("pdd"),
+        appId: (item.appId || "").trim(),
+        storeMallList: normalizePersistedStoreMallList(
+          (item as unknown as { storeMallList?: unknown; storeMallNames?: unknown }).storeMallList,
+          (item as unknown as { storeMallList?: unknown; storeMallNames?: unknown }).storeMallNames
+        ),
+        cookiePath: normalizeNullable(item.cookiePath),
+        cookieCheckedAt: normalizeNullable(item.cookieCheckedAt),
+        cookieReason: normalizeNullable(item.cookieReason),
+      }));
+      const ensuredAccounts = accountsLoaded.length > 0 ? accountsLoaded : [blankPddAccount()];
+
+      setPddAccounts(ensuredAccounts);
+      setPddLoginUrl(normalizedLoginUrl);
+      setPddOcrKey(parsed.ocrKey || "");
+      if (shouldToast) {
+        messageApi.success("已加载拼多多配置");
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const base = [blankPddAccount()];
+      setPddAccounts(base);
+      setPddLoginUrl(PDD_DEFAULT_LOGIN_URL);
+      setPddOcrKey("");
+      messageApi.error(`加载拼多多配置失败: ${detail}`);
+    }
+  };
+
+  const updatePddAccount = (id: string, patch: Partial<PddAccountInput>): void => {
+    setPddAccounts((prev) => {
+      const next = prev.map((item) => (item.id === id ? { ...item, ...patch } : item));
+      persistPddConfig(next, pddLoginUrl, pddOcrKey, false);
+      return next;
+    });
+  };
+
+  const addPddAccount = (): void => {
+    const newRow = blankPddAccount();
+    setPddAccounts((prev) => {
+      const next = [...prev, newRow];
+      persistPddConfig(next, pddLoginUrl, pddOcrKey, false);
+      return next;
+    });
+  };
+
+  const deletePddAccount = (id: string): void => {
+    setPddAccounts((prev) => {
+      const next = prev.filter((item) => item.id !== id);
+      const ensured = next.length > 0 ? next : [blankPddAccount()];
+      persistPddConfig(ensured, pddLoginUrl, pddOcrKey, false);
+      return ensured;
+    });
+  };
+
+  const loginPddAccount = async (account: PddAccountInput): Promise<void> => {
+    const name = account.name.trim();
+    const loginAccount = account.account.trim();
+    const password = account.password;
+    const appId = account.appId.trim();
+    const loginUrl = pddLoginUrl.trim();
+
+    if (!name || !loginAccount || !password) {
+      messageApi.warning("请完整填写名称、账号和密码");
+      return;
+    }
+    if (!appId) {
+      messageApi.warning("请先填写应用ID");
+      return;
+    }
+    if (!loginUrl) {
+      messageApi.warning("请先填写拼多多登录地址");
+      return;
+    }
+
+    setPddLoggingInAccountId(account.id);
+    try {
+      const response = await invoke<PddLoginResponse>("pdd_login_with_browser", {
+        request: {
+          name,
+          account: loginAccount,
+          password,
+          appId,
+          loginUrl,
+          cookiePath: account.cookiePath,
+          ocrKey: normalizeNullable(pddOcrKey),
+        } as PddLoginRequest,
+      });
+      const ownerMallList =
+        Array.isArray(response.ownerMallList) && response.ownerMallList.length > 0
+          ? response.ownerMallList
+              .map((item) => normalizeStoreItem(item))
+              .filter((item): item is PddStoreItem => item !== null)
+          : Array.isArray(response.ownerMallNameList)
+            ? response.ownerMallNameList
+                .map((name) => String(name).trim())
+                .filter((name) => name.length > 0)
+                .map((accountName) => ({ accountName, code: "" }))
+            : [];
+      updatePddAccount(account.id, {
+        cookiePath: null,
+        cookieStatus: "valid",
+        cookieReason: response.message,
+        storeMallList: ownerMallList,
+      });
+      const summary =
+        response.message ||
+        `登录成功，已抓取店铺列表 ${ownerMallList.length} 条`;
+      messageApi.success(summary);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      updatePddAccount(account.id, {
+        cookieStatus: "invalid",
+        cookieReason: detail,
+      });
+      messageApi.error(`登录失败: ${detail}`);
+    } finally {
+      setPddLoggingInAccountId(null);
+    }
+  };
+
+  const copyPddStoreItem = async (store: PddStoreItem): Promise<void> => {
+    const accountName = String(store.accountName ?? "").trim();
+    const code = String(store.code ?? "").trim();
+    if (!accountName && !code) {
+      messageApi.warning("当前店铺没有可复制的内容");
+      return;
+    }
+    const payload = `${accountName}\t${code}`;
+    try {
+      await copyTextToClipboard(payload);
+      messageApi.success("已复制店铺名和编号");
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      messageApi.error(`复制失败: ${detail}`);
+    }
+  };
+
+  const choosePddSyncFile = async (): Promise<void> => {
+    try {
+      const selected = await open({
+        multiple: false,
+        directory: false,
+        filters: [
+          { name: "PHP 文件", extensions: ["php"] },
+          { name: "全部文件", extensions: ["*"] },
+        ],
+      });
+      if (!selected || Array.isArray(selected)) {
+        return;
+      }
+      setPddSyncFilePath(selected);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      messageApi.error(`选择文件失败: ${detail}`);
+    }
+  };
+
+  const triggerPddQuickSync = async (): Promise<void> => {
+    const filePath = pddSyncFilePath.trim();
+    const receiveIdText = pddSyncReceiveId.trim();
+    if (!filePath) {
+      messageApi.warning("请先填写文件路径");
+      return;
+    }
+    if (pddSyncTaskId === undefined) {
+      messageApi.warning("请先选择类型");
+      return;
+    }
+    if (!/^\d+$/.test(receiveIdText)) {
+      messageApi.warning("替换ID必须是纯数字");
+      return;
+    }
+    if (!pddSyncServerAlias) {
+      messageApi.warning("请先选择服务器");
+      return;
+    }
+
+    const receiveId = Number(receiveIdText);
+    setPddSyncing(true);
+    try {
+      const response = await invoke<PddQuickSyncResponse>("pdd_quick_sync", {
+        request: {
+          filePath,
+          serverAlias: pddSyncServerAlias,
+          taskId: pddSyncTaskId,
+          receiveId,
+        } as PddQuickSyncRequest,
+      });
+      const feedback = [
+        response.message,
+        `文件: ${response.filePath}`,
+        `服务器: ${response.serverAlias}`,
+        `类型(task): ${response.taskId}`,
+        `替换: ${response.oldReceiveId ?? "-"} -> ${response.newReceiveId}`,
+        `行号: ${response.replacedLine ?? "-"}`,
+        `替换数量: ${response.replacedCount}`,
+        `时间: ${response.updatedAt}`,
+      ].join("\n");
+      setPddSyncFeedback(feedback);
+      messageApi.success("一键同步完成");
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setPddSyncFeedback(`一键同步失败: ${detail}`);
+      messageApi.error(`一键同步失败: ${detail}`);
+    } finally {
+      setPddSyncing(false);
+    }
+  };
+
   const detectPublicIp = async (): Promise<void> => {
     setDetectingIp(true);
     setStatus({ type: "info", text: "正在检测公网 IPv4..." });
@@ -488,6 +929,7 @@ export default function App() {
     bootstrappedRef.current = true;
 
     loadConfig(false);
+    loadPddConfig(false);
     setHiddenSshAliases(readHiddenSshAliases());
 
     void (async () => {
@@ -521,6 +963,32 @@ export default function App() {
     void loadSshShortcuts(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [moduleKey]);
+
+  useEffect(() => {
+    if (moduleKey !== "pdd" || pddSshBootstrappedRef.current) {
+      return;
+    }
+    pddSshBootstrappedRef.current = true;
+    if (sshShortcuts.length === 0) {
+      void loadSshShortcuts(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moduleKey, sshShortcuts.length]);
+
+  useEffect(() => {
+    setPddSyncServerAlias((prev) => {
+      if (!prev) {
+        return undefined;
+      }
+      return pddSyncServerOptions.some((item) => item.value === prev) ? prev : undefined;
+    });
+  }, [pddSyncServerOptions]);
+
+  useEffect(() => {
+    setPddExpandedAccountIds((prev) =>
+      prev.filter((id) => pddAccounts.some((account) => account.id === id))
+    );
+  }, [pddAccounts]);
 
   const updateAccount = (id: string, patch: Partial<AccountInput>): void => {
     setAccounts((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
@@ -951,6 +1419,127 @@ export default function App() {
     },
   ];
 
+  const pddStoreColumns: ColumnsType<PddStoreItem> = [
+    {
+      title: "账户名",
+      dataIndex: "accountName",
+      width: "44%",
+      render: (value) => value || "-",
+    },
+    {
+      title: "编号",
+      dataIndex: "code",
+      width: "36%",
+      render: (value) => value || "-",
+    },
+    {
+      title: "操作",
+      key: "actions",
+      width: "20%",
+      render: (_, record) => (
+        <Button
+          size="small"
+          icon={<CopyOutlined />}
+          className="pdd-store-copy-btn"
+          onClick={() => void copyPddStoreItem(record)}
+        >
+          复制
+        </Button>
+      ),
+    },
+  ];
+
+  const pddColumns: ColumnsType<PddAccountInput> = [
+    {
+      title: "名称",
+      dataIndex: "name",
+      width: "18%",
+      render: (_, record) => (
+        <Input
+          value={record.name}
+          placeholder="例如 主店账号"
+          onChange={(event) => updatePddAccount(record.id, { name: event.target.value })}
+        />
+      ),
+    },
+    {
+      title: "账号",
+      dataIndex: "account",
+      width: "22%",
+      render: (_, record) => (
+        <Input
+          value={record.account}
+          placeholder="手机号 / 用户名"
+          onChange={(event) => updatePddAccount(record.id, { account: event.target.value })}
+        />
+      ),
+    },
+    {
+      title: "密码",
+      dataIndex: "password",
+      width: "18%",
+      render: (_, record) => (
+        <Input.Password
+          value={record.password}
+          placeholder="密码"
+          onChange={(event) => updatePddAccount(record.id, { password: event.target.value })}
+        />
+      ),
+    },
+    {
+      title: "应用ID",
+      dataIndex: "appId",
+      width: "14%",
+      render: (_, record) => (
+        <Input
+          value={record.appId}
+          placeholder="例如 151203"
+          onChange={(event) =>
+            updatePddAccount(record.id, {
+              appId: event.target.value.replace(/[^\d]/g, ""),
+            })
+          }
+        />
+      ),
+    },
+    {
+      title: "店铺数",
+      dataIndex: "storeMallList",
+      width: "10%",
+      render: (_, record) => {
+        const count = Array.isArray(record.storeMallList) ? record.storeMallList.length : 0;
+        return <Typography.Text type={count > 0 ? undefined : "secondary"}>{count}</Typography.Text>;
+      },
+    },
+    {
+      title: "操作",
+      key: "actions",
+      width: "14%",
+      render: (_, record) => (
+        <Space size={6} wrap>
+          <Button
+            size="small"
+            type="primary"
+            loading={pddLoggingInAccountId === record.id}
+            onClick={() => void loginPddAccount(record)}
+          >
+            登录
+          </Button>
+          <Tooltip title="删除账号">
+            <Button
+              size="small"
+              shape="circle"
+              danger
+              className="icon-action-btn"
+              icon={<DeleteOutlined />}
+              onClick={() => deletePddAccount(record.id)}
+            />
+          </Tooltip>
+        </Space>
+      ),
+    },
+  ];
+
   const aliyunPage = (
     <div className="workspace-stack">
       <Card className="topbar-card" bordered={false}>
@@ -1359,6 +1948,211 @@ export default function App() {
     </div>
   );
 
+  const pddPage = (
+    <div className="workspace-stack">
+      <Card className="topbar-card" bordered={false}>
+        <div className="topbar-inner">
+          <div className="topbar-left">
+            <div className="topbar-title-col">
+              <Typography.Text strong className="topbar-title">
+                拼多多开放平台
+              </Typography.Text>
+              <Typography.Text className="topbar-desc">账号登录与应用ID管理</Typography.Text>
+            </div>
+          </div>
+          <div className="topbar-right">
+            <Space wrap className="topbar-actions">
+              <Button size="small" icon={<PlusOutlined />} onClick={addPddAccount}>
+                新增账号
+              </Button>
+              <Button
+                size="small"
+                icon={<SaveOutlined />}
+                onClick={() => {
+                  persistPddConfig();
+                }}
+              >
+                保存配置
+              </Button>
+              <Button
+                size="small"
+                icon={<DownloadOutlined />}
+                onClick={() => {
+                  loadPddConfig(true);
+                }}
+              >
+                加载配置
+              </Button>
+            </Space>
+          </div>
+        </div>
+      </Card>
+
+      <div className="stat-row">
+        <div className="stat-card stat-card-ip">账号 {pddAccounts.length}</div>
+        <div className="stat-card stat-card-account">已填应用ID {pddFilledAppIdCount}</div>
+        <div className="stat-card stat-card-rule">店铺 {pddTotalStoreCount}（未填ID {pddMissingAppIdCount}）</div>
+      </div>
+
+      <Card className="section-card" bordered={false}>
+        <Typography.Title level={4} className="section-block-title">
+          一键同步
+        </Typography.Title>
+        <div className="pdd-sync-row">
+          <Space.Compact block className="pdd-sync-file-picker">
+            <Input
+              value={pddSyncFilePath}
+              onChange={(event) => setPddSyncFilePath(event.target.value)}
+              placeholder="请选择或输入文件路径"
+              addonBefore="文件"
+            />
+            <Button onClick={() => void choosePddSyncFile()}>选择文件</Button>
+          </Space.Compact>
+          <Select
+            value={pddSyncTaskId}
+            options={PDD_SYNC_TASK_OPTIONS}
+            onChange={(value) => setPddSyncTaskId(value)}
+            allowClear
+            placeholder="选择类型（按 task id 匹配）"
+            className="pdd-sync-type-select"
+          />
+          <Input
+            value={pddSyncReceiveId}
+            onChange={(event) => setPddSyncReceiveId(event.target.value.replace(/[^\d]/g, ""))}
+            placeholder="输入要替换的新ID"
+            addonBefore="替换ID"
+          />
+          <Select
+            value={pddSyncServerAlias}
+            options={pddSyncServerOptions}
+            onChange={(value) => setPddSyncServerAlias(value)}
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="选择服务器（仅显示未隐藏快捷连接）"
+            className="pdd-sync-server-select"
+            notFoundContent="暂无可用服务器，请先到快捷连接中设置为显示"
+          />
+          <Button
+            type="primary"
+            className="pdd-sync-action-btn"
+            loading={pddSyncing}
+            onClick={() => void triggerPddQuickSync()}
+          >
+            一键同步
+          </Button>
+        </div>
+        <div className="pdd-sync-feedback-block">
+          <Typography.Text strong className="pdd-sync-feedback-title">
+            结果反馈
+          </Typography.Text>
+          <Input.TextArea
+            value={pddSyncFeedback}
+            readOnly
+            autoSize={{ minRows: 3, maxRows: 6 }}
+            placeholder="执行结果会在这里显示"
+          />
+        </div>
+      </Card>
+
+      <Card className="section-card" bordered={false}>
+        <Collapse
+          className="pdd-login-collapse"
+          ghost
+          defaultActiveKey={[]}
+          expandIconPosition="end"
+          items={[
+            {
+              key: "pdd-login-settings",
+              label: "登录设置",
+              children: (
+                <div className="pdd-login-collapse-body">
+                  <Typography.Paragraph type="secondary" className="section-help">
+                    按完整链路执行：自动登录、自动滑块（失败可人工），成功后直接进入授权管理详情页并抓取 page 请求数据。
+                  </Typography.Paragraph>
+                  <Input
+                    className="run-inline-input"
+                    value={pddLoginUrl}
+                    onChange={(event) => setPddLoginUrl(event.target.value)}
+                    placeholder="拼多多登录地址，例如 https://open.pinduoduo.com/application/home"
+                    addonBefore="登录地址"
+                  />
+                  <Input.Password
+                    className="run-inline-input"
+                    value={pddOcrKey}
+                    onChange={(event) => setPddOcrKey(event.target.value)}
+                    placeholder="滑块解密 K（留空则仅人工滑块）"
+                    addonBefore="解密 K"
+                  />
+                </div>
+              ),
+            },
+          ]}
+        />
+      </Card>
+
+      <Card className="section-card" bordered={false}>
+        <Typography.Title level={4} className="section-block-title">
+          账号列表
+        </Typography.Title>
+        <Table<PddAccountInput>
+          className="modern-table pdd-account-table"
+          rowKey="id"
+          columns={pddColumns}
+          dataSource={pddAccounts}
+          expandable={{
+            columnWidth: 110,
+            expandedRowKeys: pddExpandedAccountIds,
+            onExpandedRowsChange: (keys) =>
+              setPddExpandedAccountIds(keys.map((key) => String(key))),
+            rowExpandable: (record) =>
+              Array.isArray(record.storeMallList) && record.storeMallList.length > 0,
+            expandIcon: ({ expanded, onExpand, record, expandable }) =>
+              expandable ? (
+                <Button
+                  size="small"
+                  className="pdd-expand-trigger"
+                  icon={expanded ? <DownOutlined /> : <RightOutlined />}
+                  onClick={(event) => onExpand(record, event)}
+                >
+                  {expanded ? "收起" : "展开"}
+                </Button>
+              ) : (
+                <span className="pdd-expand-placeholder">-</span>
+              ),
+            expandedRowRender: (record) => (
+              <Table<PddStoreItem>
+                className="pdd-store-table"
+                size="small"
+                rowKey={(row, index) => `${record.id}-${row.accountName}-${row.code}-${index}`}
+                columns={pddStoreColumns}
+                dataSource={record.storeMallList}
+                pagination={false}
+                tableLayout="fixed"
+                locale={{ emptyText: "暂无店铺数据" }}
+              />
+            ),
+          }}
+          size="small"
+          pagination={{ pageSize: 6, showSizeChanger: false }}
+          tableLayout="fixed"
+          locale={{ emptyText: "暂无账号，请点击“新增账号”" }}
+        />
+      </Card>
+
+      <Card className="section-card" bordered={false}>
+        <Typography.Title level={4} className="section-block-title">
+          店铺列表说明
+        </Typography.Title>
+        <Typography.Paragraph type="secondary" className="section-help">
+          点击账号行的“登录”后，程序会自动进入对应应用详情页并监听
+          https://open-api.pinduoduo.com/pop/application/white/owner/page，
+          返回中的 ownerMallList（兼容 ownerMallNameList）会解析为“账户名 + 编号”，并保存到该账号的店铺子列表。
+        </Typography.Paragraph>
+      </Card>
+    </div>
+  );
+
   return (
     <Theme
       appearance={isDarkMode ? "dark" : "light"}
@@ -1399,6 +2193,16 @@ export default function App() {
                         <LinkOutlined className={`left-rail-item ${moduleKey === "ssh" ? "active" : ""}`} />
                       </button>
                     </Tooltip>
+                    <Tooltip title="拼多多开放平台">
+                      <button
+                        type="button"
+                        className="left-rail-switch-btn"
+                        onClick={() => setModuleKey("pdd")}
+                        aria-label="切换到拼多多开放平台"
+                      >
+                        <ShopOutlined className={`left-rail-item ${moduleKey === "pdd" ? "active" : ""}`} />
+                      </button>
+                    </Tooltip>
                   </div>
                 </div>
                 <div className="left-rail-foot">
@@ -1418,7 +2222,9 @@ export default function App() {
                   </Tooltip>
                 </div>
               </aside>
-              <div className="app-workspace">{moduleKey === "aliyun" ? aliyunPage : sshPage}</div>
+              <div className="app-workspace">
+                {moduleKey === "aliyun" ? aliyunPage : moduleKey === "ssh" ? sshPage : pddPage}
+              </div>
             </div>
           </Layout.Content>
         </Layout>
