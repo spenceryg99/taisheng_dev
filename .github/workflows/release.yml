@@ -22,7 +22,7 @@ jobs:
             bundle_args: "--bundles dmg"
           - os: windows-latest
             artifact_name: release-windows
-            bundle_args: "--bundles msi,nsis"
+            bundle_args: "--bundles msi"
 
     steps:
       - name: Checkout
