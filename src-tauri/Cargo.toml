@@ -1,5 +1,5 @@
 [package]
-name = "SP工具箱"
+name = "sp-toolbox"
 version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
