@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use chrono::Utc;
+use chrono::{NaiveDateTime, Utc};
 use hmac::{Hmac, Mac};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HOST};
 use reqwest::Method;
@@ -39,6 +39,7 @@ const LOCAL_BACKEND_DIR: &str = "/Users/spenceryg/Documents/taisheng/junziyun-v7
 const LOCAL_FRONTEND_DIR: &str = "/Users/spenceryg/Documents/taisheng/taisheng_web";
 const LOCAL_BACKEND_PORT: u16 = 9528;
 const LOCAL_FRONTEND_PORT: u16 = 9669;
+const DEFAULT_PLOG_BASE_DIR: &str = "~/junziyun-v7/storage/logs/custom";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -271,6 +272,125 @@ struct PddSyncStepResult {
     status: String,
     exit_code: Option<i32>,
     output: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlogListFiltersRequest {
+    server_alias: String,
+    base_dir: Option<String>,
+    days: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlogListFiltersResponse {
+    type_dirs: Vec<String>,
+    log_files: Vec<String>,
+    date_dirs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PlogKeyFilters {
+    order_id: Option<String>,
+    order_no: Option<String>,
+    ext_order_id: Option<String>,
+    mobile: Option<String>,
+    channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlogCustomFieldRule {
+    name: String,
+    keys: Vec<String>,
+    contains: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedPlogCustomFieldRule {
+    name: String,
+    keys: Vec<String>,
+    contains: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlogQueryRequest {
+    server_alias: String,
+    base_dir: Option<String>,
+    start_at: String,
+    end_at: String,
+    task_types: Option<Vec<String>>,
+    type_dirs: Option<Vec<String>>,
+    log_files: Option<Vec<String>>,
+    level: Option<String>,
+    keywords: Option<Vec<String>>,
+    key_filters: Option<PlogKeyFilters>,
+    custom_fields: Option<Vec<PlogCustomFieldRule>>,
+    limit: Option<usize>,
+    context_lines: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlogQueryItem {
+    ts: Option<String>,
+    level: String,
+    task_type: String,
+    type_dir: String,
+    log_file: String,
+    message: String,
+    order_id: Option<String>,
+    order_no: Option<String>,
+    ext_order_id: Option<String>,
+    mobile: Option<String>,
+    channel: Option<String>,
+    file_path: String,
+    line_no: usize,
+    raw_line: String,
+    custom_fields: BTreeMap<String, String>,
+    context: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlogQueryResponse {
+    elapsed_ms: u128,
+    scanned_files: usize,
+    scanned_lines: usize,
+    matched_lines: usize,
+    truncated: bool,
+    items: Vec<PlogQueryItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlogTailRequest {
+    server_alias: String,
+    base_dir: Option<String>,
+    task_types: Option<Vec<String>>,
+    type_dirs: Option<Vec<String>>,
+    log_files: Option<Vec<String>>,
+    level: Option<String>,
+    keywords: Option<Vec<String>>,
+    key_filters: Option<PlogKeyFilters>,
+    custom_fields: Option<Vec<PlogCustomFieldRule>>,
+    limit: Option<usize>,
+    max_files: Option<usize>,
+    since_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlogTailResponse {
+    elapsed_ms: u128,
+    scanned_files: usize,
+    scanned_lines: usize,
+    matched_lines: usize,
+    truncated: bool,
+    items: Vec<PlogQueryItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -686,6 +806,402 @@ fn test_all_ssh_shortcuts() -> Result<Vec<SshConnectionTestResult>, String> {
 fn delete_ssh_shortcut(alias: String) -> Result<String, String> {
     let alias = validate_alias(&alias)?;
     delete_ssh_alias_from_config(alias)
+}
+
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    let target = resolve_input_path(&path)?;
+    fs::read_to_string(&target).map_err(|err| format!("读取文件失败：{} ({err})", target.display()))
+}
+
+#[tauri::command]
+fn write_text_file(path: String, content: String) -> Result<String, String> {
+    let target = resolve_output_path(&path)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("创建目录失败：{} ({err})", parent.display()))?;
+    }
+    fs::write(&target, content).map_err(|err| format!("写入文件失败：{} ({err})", target.display()))?;
+    Ok(target.display().to_string())
+}
+
+#[tauri::command]
+fn plog_list_filters(request: PlogListFiltersRequest) -> Result<PlogListFiltersResponse, String> {
+    let server_alias = validate_alias(&request.server_alias)?;
+    let base_dir = normalize_remote_base_dir(request.base_dir.as_deref())?;
+    let days = request.days.unwrap_or(7).clamp(1, 60);
+    let cutoff_day = (Utc::now().date_naive() - chrono::Duration::days((days - 1) as i64))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let script = format!(
+        r#"set -e
+BASE={base_dir}
+CUTOFF={cutoff_day}
+if [ ! -d "$BASE" ]; then
+  exit 0
+fi
+find "$BASE" -mindepth 1 -maxdepth 1 -type d | while IFS= read -r dir; do
+  t=$(basename "$dir")
+  printf 'TYPE|%s\n' "$t"
+  find "$dir" -mindepth 2 -maxdepth 2 -type f -name '*.log' 2>/dev/null | while IFS= read -r file; do
+    d=$(basename "$(dirname "$file")")
+    if [ "$d" \< "$CUTOFF" ]; then
+      continue
+    fi
+    lf=$(basename "$file" .log)
+    printf 'DATE|%s\n' "$d"
+    printf 'LOG|%s\n' "$lf"
+  done
+done
+"#,
+        base_dir = shell_single_quote(&base_dir),
+        cutoff_day = shell_single_quote(&cutoff_day)
+    );
+    let remote_cmd = format!("bash -lc {}", shell_single_quote(&script));
+    let (exit_code, output) = run_ssh_command(server_alias, &remote_cmd)?;
+    if exit_code != 0 {
+        return Err(format!(
+            "读取远程日志筛选项失败（exitCode={}）：{}",
+            exit_code, output
+        ));
+    }
+
+    let mut type_dirs = BTreeSet::new();
+    let mut log_files = BTreeSet::new();
+    let mut date_dirs = BTreeSet::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("TYPE|") {
+            if !value.trim().is_empty() {
+                type_dirs.insert(value.trim().to_string());
+            }
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("LOG|") {
+            if !value.trim().is_empty() {
+                log_files.insert(value.trim().to_string());
+            }
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("DATE|") {
+            if !value.trim().is_empty() {
+                date_dirs.insert(value.trim().to_string());
+            }
+        }
+    }
+
+    Ok(PlogListFiltersResponse {
+        type_dirs: type_dirs.into_iter().collect(),
+        log_files: log_files.into_iter().collect(),
+        date_dirs: date_dirs.into_iter().collect(),
+    })
+}
+
+#[tauri::command]
+fn plog_query_remote(request: PlogQueryRequest) -> Result<PlogQueryResponse, String> {
+    let started_at = Instant::now();
+    let server_alias = validate_alias(&request.server_alias)?;
+    let base_dir = normalize_remote_base_dir(request.base_dir.as_deref())?;
+    let start_dt = parse_query_datetime(&request.start_at, "startAt")?;
+    let end_dt = parse_query_datetime(&request.end_at, "endAt")?;
+    if start_dt > end_dt {
+        return Err("startAt 不能大于 endAt".to_string());
+    }
+
+    let task_type_filter = normalize_simple_filter_values(request.task_types, "taskTypes")?;
+    let type_dir_filter = normalize_simple_filter_values(request.type_dirs, "typeDirs")?;
+    let log_file_filter = normalize_simple_filter_values(request.log_files, "logFiles")?;
+    let keywords = normalize_simple_filter_values(request.keywords, "keywords")?
+        .into_iter()
+        .map(|item| item.to_lowercase())
+        .collect::<Vec<_>>();
+    let key_filters = normalize_key_filters(request.key_filters.unwrap_or_default())?;
+    let custom_field_rules = normalize_custom_field_rules(request.custom_fields)?;
+
+    let level_filter = request
+        .level
+        .as_deref()
+        .unwrap_or("all")
+        .trim()
+        .to_lowercase();
+    if !matches!(level_filter.as_str(), "all" | "info" | "error" | "warn" | "unknown") {
+        return Err("level 仅支持 all/info/error/warn/unknown".to_string());
+    }
+
+    let limit = request.limit.unwrap_or(200).clamp(1, 1000);
+    let _context_lines = request.context_lines.unwrap_or(0).min(3);
+    let max_remote_lines = (limit.saturating_mul(30)).clamp(3000, 20000);
+
+    let start_at_text = start_dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    let end_at_text = end_dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    let start_day_text = start_dt.format("%Y-%m-%d").to_string();
+    let end_day_text = end_dt.format("%Y-%m-%d").to_string();
+
+    let script = format!(
+        r#"set -e
+BASE={base_dir}
+START_AT={start_at}
+END_AT={end_at}
+START_DAY={start_day}
+END_DAY={end_day}
+MAX_LINES={max_lines}
+if [ ! -d "$BASE" ]; then
+  exit 0
+fi
+find "$BASE" -mindepth 3 -maxdepth 3 -type f -name '*.log' 2>/dev/null | sort -r | while IFS= read -r f; do
+  d=$(basename "$(dirname "$f")")
+  if [ "$d" \< "$START_DAY" ] || [ "$d" \> "$END_DAY" ]; then
+    continue
+  fi
+  awk -v file="$f" -v s="$START_AT" -v e="$END_AT" '
+    {{
+      if (length($0) < 19) next;
+      ts = substr($0, 1, 19);
+      if (ts < s || ts > e) next;
+      printf("L|%s|%d|%s\n", file, NR, $0);
+    }}
+  ' "$f"
+done | head -n "$MAX_LINES"
+"#,
+        base_dir = shell_single_quote(&base_dir),
+        start_at = shell_single_quote(&start_at_text),
+        end_at = shell_single_quote(&end_at_text),
+        start_day = shell_single_quote(&start_day_text),
+        end_day = shell_single_quote(&end_day_text),
+        max_lines = max_remote_lines
+    );
+    let remote_cmd = format!("bash -lc {}", shell_single_quote(&script));
+    let (exit_code, output) = run_ssh_command(server_alias, &remote_cmd)?;
+    if exit_code != 0 {
+        return Err(format!(
+            "执行远程日志查询失败（exitCode={}）：{}",
+            exit_code, output
+        ));
+    }
+
+    let mut scanned_files = BTreeSet::new();
+    let mut scanned_lines = 0usize;
+    let mut items = Vec::new();
+
+    for line in output.lines() {
+        let mut parts = line.splitn(4, '|');
+        let Some(prefix) = parts.next() else {
+            continue;
+        };
+        if prefix != "L" {
+            continue;
+        }
+        let Some(file_path) = parts.next() else {
+            continue;
+        };
+        let Some(line_no_text) = parts.next() else {
+            continue;
+        };
+        let Some(raw_line) = parts.next() else {
+            continue;
+        };
+        let Ok(line_no) = line_no_text.parse::<usize>() else {
+            continue;
+        };
+
+        scanned_lines += 1;
+        scanned_files.insert(file_path.to_string());
+        let (type_dir, log_file) = extract_type_dir_and_log_file(file_path);
+
+        if !type_dir_filter.is_empty() && !type_dir_filter.contains(&type_dir) {
+            continue;
+        }
+        if !log_file_filter.is_empty() && !log_file_filter.contains(&log_file) {
+            continue;
+        }
+
+        if let Some(item) = build_plog_item_if_match(
+            raw_line,
+            file_path,
+            line_no,
+            &type_dir,
+            &log_file,
+            &level_filter,
+            &task_type_filter,
+            &keywords,
+            &key_filters,
+            &custom_field_rules,
+            None,
+        ) {
+            items.push(item);
+        }
+    }
+
+    items.sort_by(|a, b| {
+        let b_ts = b.ts.as_deref().unwrap_or("");
+        let a_ts = a.ts.as_deref().unwrap_or("");
+        b_ts.cmp(a_ts)
+    });
+
+    let matched_lines = items.len();
+    let truncated = matched_lines > limit || scanned_lines >= max_remote_lines;
+    if items.len() > limit {
+        items.truncate(limit);
+    }
+
+    Ok(PlogQueryResponse {
+        elapsed_ms: started_at.elapsed().as_millis(),
+        scanned_files: scanned_files.len(),
+        scanned_lines,
+        matched_lines,
+        truncated,
+        items,
+    })
+}
+
+#[tauri::command]
+fn plog_tail_remote(request: PlogTailRequest) -> Result<PlogTailResponse, String> {
+    let started_at = Instant::now();
+    let server_alias = validate_alias(&request.server_alias)?;
+    let base_dir = normalize_remote_base_dir(request.base_dir.as_deref())?;
+
+    let task_type_filter = normalize_simple_filter_values(request.task_types, "taskTypes")?;
+    let type_dir_filter = normalize_simple_filter_values(request.type_dirs, "typeDirs")?;
+    let log_file_filter = normalize_simple_filter_values(request.log_files, "logFiles")?;
+    let keywords = normalize_simple_filter_values(request.keywords, "keywords")?
+        .into_iter()
+        .map(|item| item.to_lowercase())
+        .collect::<Vec<_>>();
+    let key_filters = normalize_key_filters(request.key_filters.unwrap_or_default())?;
+    let custom_field_rules = normalize_custom_field_rules(request.custom_fields)?;
+
+    let level_filter = request
+        .level
+        .as_deref()
+        .unwrap_or("all")
+        .trim()
+        .to_lowercase();
+    if !matches!(level_filter.as_str(), "all" | "info" | "error" | "warn" | "unknown") {
+        return Err("level 仅支持 all/info/error/warn/unknown".to_string());
+    }
+
+    let since_dt = if let Some(since_text) = trim_str_to_option(request.since_at.as_deref()) {
+        Some(parse_query_datetime(since_text, "sinceAt")?)
+    } else {
+        None
+    };
+    let limit = request.limit.unwrap_or(200).clamp(1, 1000);
+    let max_files = request.max_files.unwrap_or(8).clamp(1, 30);
+    let per_file_lines = (limit / max_files.max(1)).clamp(40, 300);
+    let max_total_lines = (max_files * per_file_lines * 2).clamp(500, 15000);
+
+    let script = format!(
+        r#"set -e
+BASE={base_dir}
+MAX_FILES={max_files}
+PER_FILE_LINES={per_file_lines}
+MAX_TOTAL_LINES={max_total_lines}
+if [ ! -d "$BASE" ]; then
+  exit 0
+fi
+find "$BASE" -mindepth 3 -maxdepth 3 -type f -name '*.log' 2>/dev/null | while IFS= read -r f; do
+  mt=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
+  printf '%s|%s\n' "$mt" "$f"
+done | sort -t '|' -k1,1nr | head -n "$MAX_FILES" | cut -d'|' -f2- | while IFS= read -r f; do
+  if [ ! -f "$f" ]; then
+    continue
+  fi
+  nl -ba "$f" | tail -n "$PER_FILE_LINES" | awk -v file="$f" '
+    {{
+      line_no = $1;
+      $1 = "";
+      sub(/^[[:space:]]+/, "", $0);
+      printf("L|%s|%d|%s\n", file, line_no, $0);
+    }}
+  '
+done | tail -n "$MAX_TOTAL_LINES"
+"#,
+        base_dir = shell_single_quote(&base_dir),
+        max_files = max_files,
+        per_file_lines = per_file_lines,
+        max_total_lines = max_total_lines
+    );
+    let remote_cmd = format!("bash -lc {}", shell_single_quote(&script));
+    let (exit_code, output) = run_ssh_command(server_alias, &remote_cmd)?;
+    if exit_code != 0 {
+        return Err(format!(
+            "执行实时 tail 查询失败（exitCode={}）：{}",
+            exit_code, output
+        ));
+    }
+
+    let mut scanned_files = BTreeSet::new();
+    let mut scanned_lines = 0usize;
+    let mut items = Vec::new();
+
+    for line in output.lines() {
+        let mut parts = line.splitn(4, '|');
+        let Some(prefix) = parts.next() else {
+            continue;
+        };
+        if prefix != "L" {
+            continue;
+        }
+        let Some(file_path) = parts.next() else {
+            continue;
+        };
+        let Some(line_no_text) = parts.next() else {
+            continue;
+        };
+        let Some(raw_line) = parts.next() else {
+            continue;
+        };
+        let Ok(line_no) = line_no_text.parse::<usize>() else {
+            continue;
+        };
+
+        scanned_lines += 1;
+        scanned_files.insert(file_path.to_string());
+        let (type_dir, log_file) = extract_type_dir_and_log_file(file_path);
+        if !type_dir_filter.is_empty() && !type_dir_filter.contains(&type_dir) {
+            continue;
+        }
+        if !log_file_filter.is_empty() && !log_file_filter.contains(&log_file) {
+            continue;
+        }
+
+        if let Some(item) = build_plog_item_if_match(
+            raw_line,
+            file_path,
+            line_no,
+            &type_dir,
+            &log_file,
+            &level_filter,
+            &task_type_filter,
+            &keywords,
+            &key_filters,
+            &custom_field_rules,
+            since_dt.as_ref(),
+        ) {
+            items.push(item);
+        }
+    }
+
+    items.sort_by(|a, b| {
+        let b_ts = b.ts.as_deref().unwrap_or("");
+        let a_ts = a.ts.as_deref().unwrap_or("");
+        b_ts.cmp(a_ts)
+    });
+    let matched_lines = items.len();
+    let truncated = matched_lines > limit || scanned_lines >= max_total_lines;
+    if items.len() > limit {
+        items.truncate(limit);
+    }
+
+    Ok(PlogTailResponse {
+        elapsed_ms: started_at.elapsed().as_millis(),
+        scanned_files: scanned_files.len(),
+        scanned_lines,
+        matched_lines,
+        truncated,
+        items,
+    })
 }
 
 fn list_ssh_shortcuts_internal() -> Result<Vec<SshShortcutRow>, String> {
@@ -1643,6 +2159,493 @@ fn run_ssh_command(server_alias: &str, remote_cmd: &str) -> Result<(i32, String)
         format!("{stdout}\n{stderr}")
     };
     Ok((code, merged))
+}
+
+fn normalize_remote_base_dir(base_dir: Option<&str>) -> Result<String, String> {
+    let raw = base_dir
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .unwrap_or(DEFAULT_PLOG_BASE_DIR);
+    ensure_single_line_input(raw, "baseDir")?;
+    Ok(raw.to_string())
+}
+
+fn parse_query_datetime(value: &str, field_name: &str) -> Result<NaiveDateTime, String> {
+    NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M:%S")
+        .map_err(|_| format!("{field_name} 格式错误，必须是 YYYY-MM-DD HH:mm:ss"))
+}
+
+fn normalize_simple_filter_values(
+    source: Option<Vec<String>>,
+    field_name: &str,
+) -> Result<HashSet<String>, String> {
+    let mut values = HashSet::new();
+    for item in source.unwrap_or_default() {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.len() > 120 {
+            return Err(format!("{field_name} 中存在超长条件：{trimmed}"));
+        }
+        ensure_single_line_input(trimmed, field_name)?;
+        values.insert(trimmed.to_string());
+    }
+    Ok(values)
+}
+
+fn normalize_key_filters(filters: PlogKeyFilters) -> Result<PlogKeyFilters, String> {
+    Ok(PlogKeyFilters {
+        order_id: normalize_key_filter_value(filters.order_id, "keyFilters.orderId")?,
+        order_no: normalize_key_filter_value(filters.order_no, "keyFilters.orderNo")?,
+        ext_order_id: normalize_key_filter_value(filters.ext_order_id, "keyFilters.extOrderId")?,
+        mobile: normalize_key_filter_value(filters.mobile, "keyFilters.mobile")?,
+        channel: normalize_key_filter_value(filters.channel, "keyFilters.channel")?,
+    })
+}
+
+fn normalize_custom_field_rules(
+    rules: Option<Vec<PlogCustomFieldRule>>,
+) -> Result<Vec<NormalizedPlogCustomFieldRule>, String> {
+    let mut normalized = Vec::new();
+    let mut name_set = HashSet::new();
+    for (index, rule) in rules.unwrap_or_default().into_iter().enumerate() {
+        let field = format!("customFields[{index}]");
+        let name = rule.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name.len() > 40 {
+            return Err(format!("{field}.name 过长"));
+        }
+        ensure_single_line_input(name, &format!("{field}.name"))?;
+        let mut keys = Vec::new();
+        let mut key_set = HashSet::new();
+        for key in rule.keys {
+            let key_trimmed = key.trim();
+            if key_trimmed.is_empty() {
+                continue;
+            }
+            if key_trimmed.len() > 80 {
+                return Err(format!("{field}.keys 包含超长 key"));
+            }
+            ensure_single_line_input(key_trimmed, &format!("{field}.keys"))?;
+            let lower = key_trimmed.to_lowercase();
+            if key_set.insert(lower) {
+                keys.push(key_trimmed.to_string());
+            }
+        }
+        if keys.is_empty() {
+            continue;
+        }
+        let name_lower = name.to_lowercase();
+        if !name_set.insert(name_lower) {
+            return Err(format!("自定义字段名重复: {name}"));
+        }
+        normalized.push(NormalizedPlogCustomFieldRule {
+            name: name.to_string(),
+            keys,
+            contains: normalize_key_filter_value(
+                rule.contains,
+                &format!("{field}.contains"),
+            )?,
+        });
+    }
+    if normalized.len() > 12 {
+        return Err("customFields 最多支持 12 条".to_string());
+    }
+    Ok(normalized)
+}
+
+fn normalize_key_filter_value(value: Option<String>, field_name: &str) -> Result<Option<String>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > 120 {
+        return Err(format!("{field_name} 过长"));
+    }
+    ensure_single_line_input(trimmed, field_name)?;
+    Ok(Some(trimmed.to_string()))
+}
+
+fn ensure_single_line_input(input: &str, field_name: &str) -> Result<(), String> {
+    if input
+        .chars()
+        .any(|ch| ch == '\0' || ch == '\n' || ch == '\r')
+    {
+        return Err(format!("{field_name} 包含非法字符"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_plog_item_if_match(
+    raw_line: &str,
+    file_path: &str,
+    line_no: usize,
+    type_dir: &str,
+    log_file: &str,
+    level_filter: &str,
+    task_type_filter: &HashSet<String>,
+    keywords: &[String],
+    key_filters: &PlogKeyFilters,
+    custom_field_rules: &[NormalizedPlogCustomFieldRule],
+    since_dt: Option<&NaiveDateTime>,
+) -> Option<PlogQueryItem> {
+    let (ts, payload) = parse_plog_timestamp_and_payload(raw_line);
+    if let (Some(since), Some(ts_text)) = (since_dt, ts.as_deref()) {
+        if let Ok(ts_dt) = NaiveDateTime::parse_from_str(ts_text, "%Y-%m-%d %H:%M:%S") {
+            if ts_dt <= *since {
+                return None;
+            }
+        }
+    }
+
+    let payload_json = parse_payload_json_object(&payload);
+    let level = detect_plog_level(payload_json.as_ref(), &payload);
+    if level_filter != "all" && level != level_filter {
+        return None;
+    }
+
+    let task_type = classify_plog_task_type(log_file, &payload);
+    if !task_type_filter.is_empty() && !task_type_filter.contains(&task_type) {
+        return None;
+    }
+
+    let order_id = extract_string_with_candidates(
+        payload_json.as_ref(),
+        &["order_id", "$order_id", "$order->id", "id", "oid"],
+    );
+    let order_no = extract_string_with_candidates(
+        payload_json.as_ref(),
+        &["orderid", "$orderid", "order_sn", "$order_number", "order_no", "$order_sn"],
+    );
+    let ext_order_id = extract_string_with_candidates(
+        payload_json.as_ref(),
+        &["ext_orderid", "$ext_orderid", "operatorOrderNo"],
+    );
+    let mobile = extract_string_with_candidates(
+        payload_json.as_ref(),
+        &[
+            "mobile",
+            "$mobile",
+            "recipientmobile",
+            "contactPhone",
+            "$contactNumber",
+            "$recivePhone",
+        ],
+    );
+    let channel = extract_string_with_candidates(
+        payload_json.as_ref(),
+        &["channel", "$_channel", "channle-name", "shop_name"],
+    )
+    .or_else(|| {
+        if type_dir.is_empty() {
+            None
+        } else {
+            Some(type_dir.to_string())
+        }
+    });
+    let message = extract_plog_message(payload_json.as_ref(), &payload);
+
+    let mut custom_fields = BTreeMap::new();
+    let payload_lower = payload.to_lowercase();
+    for rule in custom_field_rules {
+        let value = extract_string_with_candidates_case_insensitive(payload_json.as_ref(), &rule.keys);
+        if let Some(value_text) = value.as_ref() {
+            custom_fields.insert(rule.name.clone(), value_text.clone());
+        }
+        if let Some(expected) = rule.contains.as_deref() {
+            let expected_lower = expected.to_lowercase();
+            let matched = value
+                .as_deref()
+                .map(|item| item.to_lowercase().contains(&expected_lower))
+                .unwrap_or(false)
+                || payload_lower.contains(&expected_lower);
+            if !matched {
+                return None;
+            }
+        }
+    }
+
+    let custom_text = custom_fields
+        .values()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let search_text = format!(
+        "{} {} {} {} {} {} {} {}",
+        raw_line,
+        message,
+        order_id.clone().unwrap_or_default(),
+        order_no.clone().unwrap_or_default(),
+        ext_order_id.clone().unwrap_or_default(),
+        mobile.clone().unwrap_or_default(),
+        channel.clone().unwrap_or_default(),
+        custom_text
+    )
+    .to_lowercase();
+    if !keywords.iter().all(|kw| search_text.contains(kw)) {
+        return None;
+    }
+
+    if !matches_key_filters(
+        key_filters,
+        order_id.as_deref(),
+        order_no.as_deref(),
+        ext_order_id.as_deref(),
+        mobile.as_deref(),
+        channel.as_deref(),
+        &search_text,
+    ) {
+        return None;
+    }
+
+    Some(PlogQueryItem {
+        ts,
+        level,
+        task_type,
+        type_dir: type_dir.to_string(),
+        log_file: log_file.to_string(),
+        message,
+        order_id,
+        order_no,
+        ext_order_id,
+        mobile,
+        channel,
+        file_path: file_path.to_string(),
+        line_no,
+        raw_line: raw_line.to_string(),
+        custom_fields,
+        context: None,
+    })
+}
+
+fn extract_type_dir_and_log_file(file_path: &str) -> (String, String) {
+    let normalized = file_path.replace('\\', "/");
+    let mut type_dir = String::new();
+    if let Some((_, suffix)) = normalized.split_once("/custom/") {
+        if let Some((dir, _rest)) = suffix.split_once('/') {
+            type_dir = dir.to_string();
+        }
+    }
+    let file_name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .strip_suffix(".log")
+        .unwrap_or("")
+        .to_string();
+    (type_dir, file_name)
+}
+
+fn parse_plog_timestamp_and_payload(raw_line: &str) -> (Option<String>, String) {
+    if raw_line.len() < 20 {
+        return (None, raw_line.trim().to_string());
+    }
+    let ts = &raw_line[0..19];
+    let maybe_dt = NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").ok();
+    if maybe_dt.is_none() {
+        return (None, raw_line.trim().to_string());
+    }
+    let mut rest = raw_line[19..].trim_start().to_string();
+    if let Some((microtime, payload)) = rest.split_once(' ') {
+        if microtime.parse::<f64>().is_ok() {
+            rest = payload.trim_start().to_string();
+        }
+    }
+    (Some(ts.to_string()), rest)
+}
+
+fn parse_payload_json_object(payload: &str) -> Option<serde_json::Map<String, Value>> {
+    let trimmed = payload.trim();
+    if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+        return None;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return None;
+    };
+    value.as_object().cloned()
+}
+
+fn detect_plog_level(payload_json: Option<&serde_json::Map<String, Value>>, payload: &str) -> String {
+    if let Some(map) = payload_json {
+        if map.contains_key("error") {
+            return "error".to_string();
+        }
+        if map.contains_key("warn") || map.contains_key("warning") {
+            return "warn".to_string();
+        }
+        if map.contains_key("info") {
+            return "info".to_string();
+        }
+    }
+    let lower = payload.to_lowercase();
+    if lower.contains("error") || payload.contains("失败") || payload.contains("异常") {
+        return "error".to_string();
+    }
+    if lower.contains("warn") || lower.contains("warning") {
+        return "warn".to_string();
+    }
+    if lower.contains("info") {
+        return "info".to_string();
+    }
+    "unknown".to_string()
+}
+
+fn extract_plog_message(payload_json: Option<&serde_json::Map<String, Value>>, payload: &str) -> String {
+    if let Some(map) = payload_json {
+        for key in ["msg", "message", "info", "error"] {
+            if let Some(value) = map.get(key).and_then(value_to_text) {
+                if !value.trim().is_empty() {
+                    return value;
+                }
+            }
+        }
+    }
+    payload.to_string()
+}
+
+fn value_to_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(v) => Some(v.to_string()),
+        Value::Number(v) => Some(v.to_string()),
+        Value::Bool(v) => Some(v.to_string()),
+        Value::Null => None,
+        _ => Some(value.to_string()),
+    }
+}
+
+fn extract_string_with_candidates(
+    payload_json: Option<&serde_json::Map<String, Value>>,
+    keys: &[&str],
+) -> Option<String> {
+    let map = payload_json?;
+    for key in keys {
+        if let Some(value) = map.get(*key).and_then(value_to_text) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_string_with_candidates_case_insensitive(
+    payload_json: Option<&serde_json::Map<String, Value>>,
+    keys: &[String],
+) -> Option<String> {
+    let map = payload_json?;
+    for key in keys {
+        if let Some(value) = map.get(key).and_then(value_to_text) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    for key in keys {
+        for (json_key, json_value) in map {
+            if json_key.eq_ignore_ascii_case(key) {
+                if let Some(value) = value_to_text(json_value) {
+                    let trimmed = value.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn classify_plog_task_type(log_file: &str, payload: &str) -> String {
+    let file_lower = log_file.to_lowercase();
+    let payload_lower = payload.to_lowercase();
+    let text = format!("{file_lower} {payload_lower}");
+
+    if text.contains("submit") || text.contains("presubmit") {
+        return "下单提单".to_string();
+    }
+    if text.contains("search")
+        || text.contains("query")
+        || text.contains("syncstatus")
+        || text.contains("pullorder")
+    {
+        return "查单状态同步".to_string();
+    }
+    if text.contains("notify") || text.contains("callback") || text.contains("callBack") {
+        return "回调通知".to_string();
+    }
+    if text.contains("schedule")
+        || text.contains("redis_lock")
+        || text.contains("kernel")
+        || text.contains("autosync")
+        || text.contains("autochange")
+        || text.contains("autorefund")
+    {
+        return "调度任务".to_string();
+    }
+    if text.contains("token")
+        || text.contains("decoder")
+        || text.contains("aes")
+        || text.contains("confignotexist")
+        || text.contains("channelnotexist")
+    {
+        return "渠道鉴权配置".to_string();
+    }
+    if text.contains("cancelorder") {
+        return "取消订单".to_string();
+    }
+    if text.contains("error")
+        || text.contains("fail")
+        || text.contains("notexist")
+        || text.contains("updateorder")
+    {
+        return "异常错误".to_string();
+    }
+    if text.contains("goods")
+        || text.contains("getallinfo")
+        || text.contains("getreciveregion")
+        || text.contains("getphoneinfo")
+        || text.contains("ocr")
+        || text.contains("commission")
+    {
+        return "商品套餐地址".to_string();
+    }
+    "其他".to_string()
+}
+
+fn matches_key_filters(
+    filters: &PlogKeyFilters,
+    order_id: Option<&str>,
+    order_no: Option<&str>,
+    ext_order_id: Option<&str>,
+    mobile: Option<&str>,
+    channel: Option<&str>,
+    fallback_text_lower: &str,
+) -> bool {
+    let check = |candidate: Option<&str>, wanted: &Option<String>| -> bool {
+        let Some(wanted_value) = wanted else {
+            return true;
+        };
+        let wanted_lower = wanted_value.to_lowercase();
+        if let Some(candidate_value) = candidate {
+            return candidate_value.to_lowercase().contains(&wanted_lower);
+        }
+        fallback_text_lower.contains(&wanted_lower)
+    };
+
+    check(order_id, &filters.order_id)
+        && check(order_no, &filters.order_no)
+        && check(ext_order_id, &filters.ext_order_id)
+        && check(mobile, &filters.mobile)
+        && check(channel, &filters.channel)
 }
 
 async fn sync_single_target(
@@ -4827,6 +5830,11 @@ pub fn run() {
             test_ssh_shortcut,
             test_all_ssh_shortcuts,
             delete_ssh_shortcut,
+            read_text_file,
+            write_text_file,
+            plog_list_filters,
+            plog_query_remote,
+            plog_tail_remote,
             pdd_login_with_browser,
             pdd_validate_cookie,
             pdd_fetch_store_configs,

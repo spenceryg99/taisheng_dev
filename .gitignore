@@ -24,3 +24,6 @@ src-tauri/target
 *.njsproj
 *.sln
 *.sw?
+
+# Temporary generated files and docs
+临时目录/
