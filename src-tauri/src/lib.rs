@@ -7,7 +7,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -35,6 +35,10 @@ const PDD_LOGIN_TIMEOUT_MS: u64 = 480_000;
 const PDD_PAGE_CAPTURE_TIMEOUT_MS: u64 = 35_000;
 const PDD_DEFAULT_VERIFY_IDF_ID: &str = "50";
 const PDD_DEFAULT_OCR_URL: &str = "http://220.167.181.200:9009/openapi/verify_code_identify/";
+const LOCAL_BACKEND_DIR: &str = "/Users/spenceryg/Documents/taisheng/junziyun-v7";
+const LOCAL_FRONTEND_DIR: &str = "/Users/spenceryg/Documents/taisheng/taisheng_web";
+const LOCAL_BACKEND_PORT: u16 = 9528;
+const LOCAL_FRONTEND_PORT: u16 = 9669;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,6 +144,16 @@ struct SshConnectionTestResult {
     exit_code: Option<i32>,
     output: String,
     checked_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalDevStartResponse {
+    backend_port: u16,
+    frontend_port: u16,
+    cleared_backend_pids: Vec<u32>,
+    cleared_frontend_pids: Vec<u32>,
+    message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -713,6 +727,29 @@ fn open_ssh_terminal(alias: String) -> Result<(), String> {
 
     #[allow(unreachable_code)]
     Err("当前系统暂不支持一键打开 SSH 终端".to_string())
+}
+
+#[tauri::command]
+fn start_local_dev_services() -> Result<LocalDevStartResponse, String> {
+    ensure_dir_exists(LOCAL_BACKEND_DIR, "后端项目目录")?;
+    ensure_dir_exists(LOCAL_FRONTEND_DIR, "前端项目目录")?;
+
+    let cleared_backend_pids = kill_processes_on_port(LOCAL_BACKEND_PORT)?;
+    let cleared_frontend_pids = kill_processes_on_port(LOCAL_FRONTEND_PORT)?;
+
+    start_local_backend_service()?;
+    wait_for_port_listen(LOCAL_BACKEND_PORT, Duration::from_secs(12))?;
+
+    start_local_frontend_service()?;
+    wait_for_port_listen(LOCAL_FRONTEND_PORT, Duration::from_secs(20))?;
+
+    Ok(LocalDevStartResponse {
+        backend_port: LOCAL_BACKEND_PORT,
+        frontend_port: LOCAL_FRONTEND_PORT,
+        cleared_backend_pids,
+        cleared_frontend_pids,
+        message: "本地前后端服务已启动".to_string(),
+    })
 }
 
 #[tauri::command]
@@ -2565,6 +2602,119 @@ fn validate_alias(alias: &str) -> Result<&str, String> {
     }
 
     Ok(trimmed)
+}
+
+fn ensure_dir_exists(path_text: &str, label: &str) -> Result<(), String> {
+    let path = Path::new(path_text);
+    if path.exists() && path.is_dir() {
+        return Ok(());
+    }
+    Err(format!("{label}不存在：{}", path.display()))
+}
+
+fn list_port_listening_pids(port: u16) -> Result<Vec<u32>, String> {
+    let output = Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output()
+        .map_err(|err| format!("查询端口 {port} 占用失败：{err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() && stdout.trim().is_empty() && !stderr.is_empty() {
+        return Err(format!("查询端口 {port} 占用失败：{stderr}"));
+    }
+
+    let mut pids = stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+fn kill_processes_on_port(port: u16) -> Result<Vec<u32>, String> {
+    let pids = list_port_listening_pids(port)?;
+    for pid in &pids {
+        let status = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .map_err(|err| format!("结束端口 {port} 对应进程 {pid} 失败：{err}"))?;
+        if !status.success() {
+            return Err(format!("结束端口 {port} 对应进程 {pid} 失败"));
+        }
+    }
+
+    if !pids.is_empty() {
+        thread::sleep(Duration::from_millis(350));
+        let remaining = list_port_listening_pids(port)?;
+        if !remaining.is_empty() {
+            return Err(format!("端口 {port} 仍被占用：{:?}", remaining));
+        }
+    }
+    Ok(pids)
+}
+
+fn build_local_service_log_path(file_name: &str) -> Result<String, String> {
+    let log_dir = env::temp_dir().join("sp_toolbox_logs");
+    fs::create_dir_all(&log_dir)
+        .map_err(|err| format!("创建日志目录失败：{} ({err})", log_dir.display()))?;
+    Ok(log_dir.join(file_name).display().to_string())
+}
+
+fn run_background_shell(command: &str, context: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let status = Command::new("cmd")
+        .args(["/C", command])
+        .status()
+        .map_err(|err| format!("{context}失败：{err}"))?;
+
+    #[cfg(not(target_os = "windows"))]
+    let status = Command::new("sh")
+        .arg("-lc")
+        .arg(command)
+        .status()
+        .map_err(|err| format!("{context}失败：{err}"))?;
+
+    if !status.success() {
+        return Err(format!("{context}失败"));
+    }
+    Ok(())
+}
+
+fn start_local_backend_service() -> Result<(), String> {
+    let backend_log = build_local_service_log_path("local-backend-9528.log")?;
+    let command = format!(
+        "cd {} && nohup php artisan serve --port={} > {} 2>&1 &",
+        shell_single_quote(LOCAL_BACKEND_DIR),
+        LOCAL_BACKEND_PORT,
+        shell_single_quote(&backend_log)
+    );
+    run_background_shell(&command, "启动后端服务")
+}
+
+fn start_local_frontend_service() -> Result<(), String> {
+    let frontend_log = build_local_service_log_path("local-frontend-9669.log")?;
+    let command = format!(
+        "cd {} && nohup npm run dev -- --port {} > {} 2>&1 &",
+        shell_single_quote(LOCAL_FRONTEND_DIR),
+        LOCAL_FRONTEND_PORT,
+        shell_single_quote(&frontend_log)
+    );
+    run_background_shell(&command, "启动前端服务")
+}
+
+fn wait_for_port_listen(port: u16, timeout: Duration) -> Result<(), String> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if !list_port_listening_pids(port)?.is_empty() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+    Err(format!(
+        "等待端口 {port} 启动超时（{} 秒）",
+        timeout.as_secs()
+    ))
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -4673,6 +4823,7 @@ pub fn run() {
             sync_all,
             list_ssh_shortcuts,
             open_ssh_terminal,
+            start_local_dev_services,
             test_ssh_shortcut,
             test_all_ssh_shortcuts,
             delete_ssh_shortcut,

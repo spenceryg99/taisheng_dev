@@ -500,6 +500,12 @@ body {
   color: #047857 !important;
 }
 
+.topbar-btn.topbar-btn-local-service {
+  border-color: #2e5b97 !important;
+  background: #dbeafe !important;
+  color: #1e3a8a !important;
+}
+
 .topbar-btn.topbar-btn-sync {
   border-color: #2563eb !important;
   background: #2563eb !important;
@@ -1703,6 +1709,12 @@ body {
   border-color: #1c6b57 !important;
   background: #0f2e28 !important;
   color: #6ee7b7 !important;
+}
+
+.app-layout.theme-dark .topbar-btn.topbar-btn-local-service {
+  border-color: #2e5b97 !important;
+  background: #102a4c !important;
+  color: #93c5fd !important;
 }
 
 .app-layout.theme-dark .topbar-btn.topbar-btn-sync,

@@ -227,6 +227,14 @@ interface WebsiteEntry {
   password: string;
 }
 
+interface StartLocalDevServicesResponse {
+  backendPort: number;
+  frontendPort: number;
+  clearedBackendPids: number[];
+  clearedFrontendPids: number[];
+  message: string;
+}
+
 const STORAGE_KEY = "aliyun-whitelist-config-v2";
 const SSH_HIDDEN_STORAGE_KEY = "ssh-hidden-aliases-v1";
 const THEME_MODE_STORAGE_KEY = "desktop-theme-mode-v2";
@@ -506,6 +514,7 @@ export default function App() {
   const [pddViewMode, setPddViewMode] = useState<PddViewMode>("manage");
   const [websiteEntries, setWebsiteEntries] = useState<WebsiteEntry[]>([]);
   const [openingWebsiteId, setOpeningWebsiteId] = useState<string | null>(null);
+  const [startingLocalServices, setStartingLocalServices] = useState(false);
 
   const bootstrappedRef = useRef(false);
   const sshBootstrappedRef = useRef(false);
@@ -954,6 +963,23 @@ export default function App() {
       messageApi.error(`打开网址失败: ${detail}`);
     } finally {
       setOpeningWebsiteId(null);
+    }
+  };
+
+  const startLocalDevServices = async (): Promise<void> => {
+    setStartingLocalServices(true);
+    try {
+      const response = await invoke<StartLocalDevServicesResponse>("start_local_dev_services");
+      const backendKilled = response.clearedBackendPids.length;
+      const frontendKilled = response.clearedFrontendPids.length;
+      messageApi.success(
+        `${response.message}（后端端口 ${response.backendPort} 清理 ${backendKilled} 个进程，前端端口 ${response.frontendPort} 清理 ${frontendKilled} 个进程）`
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      messageApi.error(`启动本地服务失败: ${detail}`);
+    } finally {
+      setStartingLocalServices(false);
     }
   };
 
@@ -2762,6 +2788,15 @@ export default function App() {
           </div>
           <div className="topbar-right">
             <Space wrap className="topbar-actions">
+              <Button
+                size="small"
+                className="topbar-btn topbar-btn-local-service"
+                icon={<CloudSyncOutlined />}
+                loading={startingLocalServices}
+                onClick={startLocalDevServices}
+              >
+                启动本地服务
+              </Button>
               <Button
                 size="small"
                 className="topbar-btn topbar-btn-account"
