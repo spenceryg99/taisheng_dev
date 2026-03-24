@@ -7,6 +7,7 @@
 - 线上测试后台地址：`https://serp.web2018.top/admin/Login/index.html`
 - 超级管理员账号：`admin`
 - 超级管理员密码：`admin2019`
+- 后续所有 Git commit 信息统一使用中文。
 
 ---
 

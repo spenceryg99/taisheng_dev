@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { confirm as dialogConfirm, open, save } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Button,
@@ -1280,45 +1280,50 @@ export default function App() {
   };
 
   const exportConfigBackup = async (): Promise<void> => {
-    const now = new Date();
-    const selected = await save({
-      title: "导出配置",
-      defaultPath: `sp-toolbox-config-${formatDateStampText(now)}.json`,
-      filters: [{ name: "JSON 文件", extensions: ["json"] }],
-    });
-    if (!selected) {
-      return;
-    }
-
-    const payload: ConfigBackupFile = {
-      schema: CONFIG_BACKUP_SCHEMA,
-      version: 1,
-      exportedAt: now.toISOString(),
-      data: {
-        aliyun: {
-          accounts,
-          targets,
-        },
-        pdd: {
-          loginUrl: pddLoginUrl.trim() || PDD_DEFAULT_LOGIN_URL,
-          ocrKey: pddOcrKey,
-          accounts: pddAccounts,
-          syncFilePath: pddSyncFilePath.trim(),
-          syncTaskId: pddSyncTaskId ?? null,
-          syncServerAlias: pddSyncServerAlias ?? null,
-        },
-        websiteEntries,
-        logTemplates,
-        hiddenSshAliases,
-        themeMode,
-      },
-    };
-
-    setConfigTransferAction("export");
     try {
+      const selected = await open({
+        title: "选择导出目录",
+        multiple: false,
+        directory: true,
+      });
+      if (!selected || Array.isArray(selected)) {
+        return;
+      }
+      const now = new Date();
+      const fileName = `sp-toolbox-config-${formatDateStampText(now)}.json`;
+      const filePath = await invoke<string>("join_file_path", {
+        directory: selected,
+        fileName,
+      });
+
+      const payload: ConfigBackupFile = {
+        schema: CONFIG_BACKUP_SCHEMA,
+        version: 1,
+        exportedAt: now.toISOString(),
+        data: {
+          aliyun: {
+            accounts,
+            targets,
+          },
+          pdd: {
+            loginUrl: pddLoginUrl.trim() || PDD_DEFAULT_LOGIN_URL,
+            ocrKey: pddOcrKey,
+            accounts: pddAccounts,
+            syncFilePath: pddSyncFilePath.trim(),
+            syncTaskId: pddSyncTaskId ?? null,
+            syncServerAlias: pddSyncServerAlias ?? null,
+          },
+          websiteEntries,
+          logTemplates,
+          hiddenSshAliases,
+          themeMode,
+        },
+      };
+
+      setConfigTransferAction("export");
       const content = JSON.stringify(payload, null, 2);
-      await invoke<string>("write_text_file", { path: selected, content });
-      messageApi.success(`配置已导出：${selected}`);
+      await invoke<string>("write_text_file", { path: filePath, content });
+      messageApi.success(`配置已导出：${filePath}`);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       messageApi.error(`导出配置失败: ${detail}`);
@@ -1328,29 +1333,28 @@ export default function App() {
   };
 
   const importConfigBackup = async (): Promise<void> => {
-    const shouldContinue = await dialogConfirm("导入会覆盖当前本地配置，是否继续？", {
-      title: "导入配置",
-      kind: "warning",
-      okLabel: "继续导入",
-      cancelLabel: "取消",
-    });
+    const confirmText = "导入会覆盖当前本地配置，是否继续？";
+    const shouldContinue =
+      typeof window === "undefined" ? true : window.confirm(confirmText);
     if (!shouldContinue) {
       return;
     }
 
-    const selected = await open({
-      title: "导入配置",
-      multiple: false,
-      directory: false,
-      filters: [{ name: "JSON 文件", extensions: ["json"] }],
-    });
-    if (!selected || Array.isArray(selected)) {
-      return;
-    }
-
-    setConfigTransferAction("import");
     try {
-      const content = await invoke<string>("read_text_file", { path: selected });
+      const selected = await open({
+        title: "选择导入目录",
+        multiple: false,
+        directory: true,
+      });
+      if (!selected || Array.isArray(selected)) {
+        return;
+      }
+
+      setConfigTransferAction("import");
+      const backupFilePath = await invoke<string>("find_latest_config_backup_file", {
+        directory: selected,
+      });
+      const content = await invoke<string>("read_text_file", { path: backupFilePath });
       const parsed: unknown = JSON.parse(content);
       if (!isRecordObject(parsed)) {
         throw new Error("文件内容不是有效对象");
@@ -1421,7 +1425,7 @@ export default function App() {
       setLogTemplates(readLogQueryTemplates());
       setLogSelectedTemplateId(undefined);
       setLogTemplateName("");
-      messageApi.success(`配置导入成功：${importedLabels.join("、")}`);
+      messageApi.success(`配置导入成功：${importedLabels.join("、")}（${backupFilePath}）`);
       setSettingsOpen(false);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -4401,7 +4405,7 @@ export default function App() {
                 导出配置
               </Typography.Title>
               <Typography.Paragraph type="secondary" className="settings-drawer-card-desc">
-                打包导出阿里云、拼多多、网址、日志模板等本地配置。
+                先选择一个文件夹，再自动生成配置备份文件。
               </Typography.Paragraph>
               <Button
                 type="primary"
@@ -4420,7 +4424,7 @@ export default function App() {
                 导入配置
               </Typography.Title>
               <Typography.Paragraph type="secondary" className="settings-drawer-card-desc">
-                选择已导出的 JSON 文件并恢复配置。导入会覆盖当前本地配置。
+                先选择一个文件夹，系统会自动读取该目录下最新的配置备份文件。
               </Typography.Paragraph>
               <Button
                 block

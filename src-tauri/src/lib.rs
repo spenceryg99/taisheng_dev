@@ -826,6 +826,65 @@ fn write_text_file(path: String, content: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn join_file_path(directory: String, file_name: String) -> Result<String, String> {
+    let dir = resolve_input_path(&directory)?;
+    if !dir.exists() || !dir.is_dir() {
+        return Err(format!("目录不存在：{}", dir.display()));
+    }
+    let trimmed_name = file_name.trim();
+    if trimmed_name.is_empty() {
+        return Err("文件名不能为空".to_string());
+    }
+    if trimmed_name.contains('/') || trimmed_name.contains('\\') {
+        return Err("文件名不能包含路径分隔符".to_string());
+    }
+    Ok(dir.join(trimmed_name).display().to_string())
+}
+
+#[tauri::command]
+fn find_latest_config_backup_file(directory: String) -> Result<String, String> {
+    let dir = resolve_input_path(&directory)?;
+    if !dir.exists() || !dir.is_dir() {
+        return Err(format!("目录不存在：{}", dir.display()));
+    }
+
+    let mut latest: Option<(PathBuf, std::time::SystemTime, String)> = None;
+    let entries = fs::read_dir(&dir).map_err(|err| format!("读取目录失败：{} ({err})", dir.display()))?;
+    for entry in entries {
+        let item = entry.map_err(|err| format!("读取目录项失败：{} ({err})", dir.display()))?;
+        let path = item.path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = item.file_name().to_string_lossy().to_string();
+        if !file_name.ends_with(".json") || !file_name.contains("sp-toolbox-config") {
+            continue;
+        }
+        let modified = item
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match &latest {
+            None => {
+                latest = Some((path, modified, file_name));
+            }
+            Some((_, latest_time, latest_name)) => {
+                if modified > *latest_time || (modified == *latest_time && file_name > *latest_name) {
+                    latest = Some((path, modified, file_name));
+                }
+            }
+        }
+    }
+
+    if let Some((path, _, _)) = latest {
+        return Ok(path.display().to_string());
+    }
+
+    Err("该目录下未找到配置备份文件（sp-toolbox-config*.json）".to_string())
+}
+
+#[tauri::command]
 fn plog_list_filters(request: PlogListFiltersRequest) -> Result<PlogListFiltersResponse, String> {
     let server_alias = validate_alias(&request.server_alias)?;
     let base_dir = normalize_remote_base_dir(request.base_dir.as_deref())?;
@@ -5832,6 +5891,8 @@ pub fn run() {
             delete_ssh_shortcut,
             read_text_file,
             write_text_file,
+            join_file_path,
+            find_latest_config_backup_file,
             plog_list_filters,
             plog_query_remote,
             plog_tail_remote,
