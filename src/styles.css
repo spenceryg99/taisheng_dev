@@ -1932,6 +1932,10 @@ body {
   margin-bottom: 10px;
 }
 
+.log-root-switch-row {
+  margin-bottom: 10px;
+}
+
 .log-template-row .ant-select,
 .log-template-row .ant-input {
   width: 100%;

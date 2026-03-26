@@ -13,6 +13,7 @@ import {
   Popconfirm,
   Segmented,
   Select,
+  Switch,
   Space,
   Table,
   Tag,
@@ -133,6 +134,11 @@ interface SshShortcutRow {
   error?: string | null;
 }
 
+interface SshShortcutMeta {
+  expireAt: string | null;
+  remark: string;
+}
+
 interface SshConnectionTestResult {
   alias: string;
   status: SshConnectionState;
@@ -245,6 +251,7 @@ interface PlogListFiltersRequest {
   serverAlias: string;
   baseDir?: string;
   days?: number;
+  useRootSudo?: boolean;
 }
 
 interface PlogListFiltersResponse {
@@ -281,6 +288,7 @@ interface PlogQueryRequest {
   customFields?: PlogCustomFieldRule[];
   limit?: number;
   contextLines?: number;
+  useRootSudo?: boolean;
 }
 
 interface PlogQueryItem {
@@ -324,6 +332,7 @@ interface PlogTailRequest {
   limit?: number;
   maxFiles?: number;
   sinceAt?: string;
+  useRootSudo?: boolean;
 }
 
 interface PlogTailResponse {
@@ -337,6 +346,7 @@ interface PlogTailResponse {
 
 interface LogQueryTemplatePayload {
   baseDir: string;
+  useRootSudo: boolean;
   startAt: string;
   endAt: string;
   selectedTaskTypes: string[];
@@ -366,6 +376,7 @@ interface ConfigBackupPayload {
   websiteEntries: WebsiteEntry[];
   logTemplates: LogQueryTemplate[];
   hiddenSshAliases: string[];
+  sshShortcutMetaMap: Record<string, SshShortcutMeta>;
   themeMode: ThemeMode;
 }
 
@@ -378,6 +389,7 @@ interface ConfigBackupFile {
 
 const STORAGE_KEY = "aliyun-whitelist-config-v2";
 const SSH_HIDDEN_STORAGE_KEY = "ssh-hidden-aliases-v1";
+const SSH_META_STORAGE_KEY = "ssh-shortcut-meta-v1";
 const THEME_MODE_STORAGE_KEY = "desktop-theme-mode-v2";
 const PDD_STORAGE_KEY = "pdd-open-platform-manager-v1";
 const WEBSITE_STORAGE_KEY = "website-login-manager-v1";
@@ -385,7 +397,7 @@ const PLOG_TEMPLATE_STORAGE_KEY = "plog-query-templates-v1";
 const CONFIG_BACKUP_SCHEMA = "sp-toolbox-config";
 const PDD_DEFAULT_LOGIN_URL = "https://open.pinduoduo.com/application/home";
 const PDD_LEGACY_LOGIN_URL = "https://mms.pinduoduo.com/login/";
-const DEFAULT_PLOG_BASE_DIR = "~/junziyun-v7/storage/logs/custom";
+const DEFAULT_PLOG_BASE_DIR = "/root/junziyun/storage/logs/custom";
 const LOG_TASK_TYPE_OPTIONS = [
   "下单提单",
   "查单状态同步",
@@ -397,6 +409,35 @@ const LOG_TASK_TYPE_OPTIONS = [
   "商品套餐地址",
   "其他",
 ] as const;
+const LOG_TASK_LOG_FILE_HINTS: Record<(typeof LOG_TASK_TYPE_OPTIONS)[number], string[]> = {
+  下单提单: ["submit", "presubmit", "order", "createorder", "order_submit"],
+  查单状态同步: ["search", "query", "syncstatus", "pullorder", "order_status"],
+  回调通知: ["notify", "callback", "notifycallback", "call_back"],
+  调度任务: ["schedule", "autosync", "autochange", "autorefund", "cron", "kernel"],
+  渠道鉴权配置: ["token", "decoder", "aes", "config", "channel", "auth"],
+  取消订单: ["cancelorder", "cancel", "refund_cancel"],
+  异常错误: ["error", "fail", "exception", "notexist", "updateorder"],
+  商品套餐地址: ["goods", "getallinfo", "getreciveregion", "getphoneinfo", "commission", "ocr"],
+  其他: ["CustomSchedule", "OrderService", "OrderKernel", "Pinduoduo", "Notify", "auto_change"],
+};
+const LOG_FALLBACK_LOG_FILE_OPTIONS = Array.from(
+  new Set(
+    Object.values(LOG_TASK_LOG_FILE_HINTS).flat().concat([
+      "Notify",
+      "NotifyCallback",
+      "CustomSchedule",
+      "auto_change",
+      "Pinduoduo",
+      "HuaShu",
+      "HuaShuThree",
+      "MaLiang",
+      "XinXiao",
+      "KuaiShangYun",
+      "OrderService",
+      "OrderKernel",
+    ])
+  )
+);
 const PDD_SYNC_TASK_OPTIONS: { label: string; value: number }[] = [
   { label: "泰盛卡行（task 0）", value: 0 },
   { label: "手机号卡订单管理（task 1）", value: 1 },
@@ -440,6 +481,13 @@ function formatDateStampText(date: Date): string {
   const min = pad2(date.getMinutes());
   const sec = pad2(date.getSeconds());
   return `${y}${m}${d}-${h}${min}${sec}`;
+}
+
+function formatDateText(date: Date): string {
+  const y = date.getFullYear();
+  const m = pad2(date.getMonth() + 1);
+  const d = pad2(date.getDate());
+  return `${y}-${m}-${d}`;
 }
 
 function isRecordObject(value: unknown): value is Record<string, unknown> {
@@ -523,6 +571,7 @@ function readLogQueryTemplates(): LogQueryTemplate[] {
           updatedAt: String(maybe.updatedAt ?? ""),
           payload: {
             baseDir: String(payload.baseDir ?? DEFAULT_PLOG_BASE_DIR),
+            useRootSudo: payload.useRootSudo !== false,
             startAt: String(payload.startAt ?? ""),
             endAt: String(payload.endAt ?? ""),
             selectedTaskTypes: Array.isArray(payload.selectedTaskTypes)
@@ -751,6 +800,66 @@ function readHiddenSshAliases(): string[] {
   }
 }
 
+function normalizeSshMetaExpireAt(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  return /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : null;
+}
+
+function normalizeSshMetaRemark(value: unknown): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value.trim();
+}
+
+function normalizeSshShortcutMetaMap(input: unknown): Record<string, SshShortcutMeta> {
+  if (!isRecordObject(input)) {
+    return {};
+  }
+  const normalized: Record<string, SshShortcutMeta> = {};
+  Object.entries(input).forEach(([alias, value]) => {
+    const aliasText = alias.trim();
+    if (!aliasText || !isRecordObject(value)) {
+      return;
+    }
+    const expireAt = normalizeSshMetaExpireAt(value.expireAt);
+    const remark = normalizeSshMetaRemark(value.remark);
+    if (!expireAt && !remark) {
+      return;
+    }
+    normalized[aliasText] = { expireAt, remark };
+  });
+  return normalized;
+}
+
+function readSshShortcutMetaMap(): Record<string, SshShortcutMeta> {
+  const raw = localStorage.getItem(SSH_META_STORAGE_KEY);
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return normalizeSshShortcutMetaMap(parsed);
+  } catch {
+    return {};
+  }
+}
+
+function persistSshShortcutMetaMap(metaMap: Record<string, SshShortcutMeta>): void {
+  const normalized = normalizeSshShortcutMetaMap(metaMap);
+  if (Object.keys(normalized).length === 0) {
+    localStorage.removeItem(SSH_META_STORAGE_KEY);
+    return;
+  }
+  localStorage.setItem(SSH_META_STORAGE_KEY, JSON.stringify(normalized));
+}
+
 function readThemeMode(): ThemeMode {
   try {
     const raw = localStorage.getItem(THEME_MODE_STORAGE_KEY);
@@ -788,6 +897,9 @@ export default function App() {
   const [sshShortcuts, setSshShortcuts] = useState<SshShortcutRow[]>([]);
   const [sshViewMode, setSshViewMode] = useState<SshViewMode>("enabled");
   const [hiddenSshAliases, setHiddenSshAliases] = useState<string[]>([]);
+  const [sshShortcutMetaMap, setSshShortcutMetaMap] = useState<Record<string, SshShortcutMeta>>(
+    () => readSshShortcutMetaMap()
+  );
   const [sshConnectionStatusMap, setSshConnectionStatusMap] = useState<
     Record<string, SshConnectionTestResult>
   >({});
@@ -820,6 +932,7 @@ export default function App() {
   const [startingLocalServices, setStartingLocalServices] = useState(false);
   const [logServerAlias, setLogServerAlias] = useState<string | undefined>(undefined);
   const [logBaseDir, setLogBaseDir] = useState(DEFAULT_PLOG_BASE_DIR);
+  const [logUseRootSudo, setLogUseRootSudo] = useState(true);
   const [logStartAt, setLogStartAt] = useState(() =>
     formatDateTimeText(new Date(Date.now() - 2 * 60 * 60 * 1000))
   );
@@ -892,6 +1005,7 @@ export default function App() {
   );
 
   const hiddenAliasSet = useMemo(() => new Set(hiddenSshAliases), [hiddenSshAliases]);
+  const currentDateText = formatDateText(new Date());
   const detectedLocationDisplay = useMemo(() => {
     const location = detectedLocation.trim();
     const carrier = detectedCarrier.trim();
@@ -950,12 +1064,13 @@ export default function App() {
     if (!keyword) {
       return baseRows;
     }
-    return baseRows.filter((row) =>
-      [row.alias, row.hostName, row.port, row.user, row.sourceFile]
+    return baseRows.filter((row) => {
+      const meta = sshShortcutMetaMap[row.alias];
+      return [row.alias, row.hostName, row.port, row.user, row.sourceFile, meta?.expireAt, meta?.remark]
         .map((item) => (item || "").toLowerCase())
-        .some((item) => item.includes(keyword))
-    );
-  }, [hiddenAliasSet, sshKeyword, sshShortcuts, sshViewMode]);
+        .some((item) => item.includes(keyword));
+    });
+  }, [hiddenAliasSet, sshKeyword, sshShortcuts, sshShortcutMetaMap, sshViewMode]);
 
   const firstVisibleAlias = useMemo(
     () => sshShortcuts.find((row) => !hiddenAliasSet.has(row.alias))?.alias ?? null,
@@ -989,6 +1104,35 @@ export default function App() {
     () => LOG_TASK_TYPE_OPTIONS.map((item) => ({ label: item, value: item })),
     []
   );
+  const logFileKeywordHints = useMemo(() => {
+    if (logSelectedTaskTypes.length === 0) {
+      return LOG_FALLBACK_LOG_FILE_OPTIONS;
+    }
+    return Array.from(
+      new Set(
+        logSelectedTaskTypes.flatMap(
+          (taskType) =>
+            LOG_TASK_LOG_FILE_HINTS[taskType as (typeof LOG_TASK_TYPE_OPTIONS)[number]] || []
+        )
+      )
+    );
+  }, [logSelectedTaskTypes]);
+  const logVisibleLogFileOptions = useMemo(() => {
+    const remoteOptions = logLogFileOptions || [];
+    const hintKeywordsLower = logFileKeywordHints.map((item) => item.toLowerCase());
+    const filteredRemoteByTask =
+      logSelectedTaskTypes.length > 0 && hintKeywordsLower.length > 0
+        ? remoteOptions.filter((name) => {
+            const lower = name.toLowerCase();
+            return hintKeywordsLower.some((keyword) => lower.includes(keyword));
+          })
+        : remoteOptions;
+    const prioritizedRemote =
+      filteredRemoteByTask.length > 0 ? filteredRemoteByTask : remoteOptions;
+    return Array.from(
+      new Set([...logSelectedLogFiles, ...prioritizedRemote, ...logFileKeywordHints])
+    ).sort((a, b) => a.localeCompare(b));
+  }, [logFileKeywordHints, logLogFileOptions, logSelectedLogFiles, logSelectedTaskTypes.length]);
   const logTemplateOptions = useMemo(
     () =>
       logTemplates.map((item) => ({
@@ -1316,6 +1460,7 @@ export default function App() {
           websiteEntries,
           logTemplates,
           hiddenSshAliases,
+          sshShortcutMetaMap,
           themeMode,
         },
       };
@@ -1407,6 +1552,13 @@ export default function App() {
         importedLabels.push("SSH 显隐");
       }
 
+      const sshShortcutMetaValue = sourceRoot.sshShortcutMetaMap;
+      if (isRecordObject(sshShortcutMetaValue)) {
+        const normalizedMetaMap = normalizeSshShortcutMetaMap(sshShortcutMetaValue);
+        persistSshShortcutMetaMap(normalizedMetaMap);
+        importedLabels.push("SSH 备注");
+      }
+
       const themeModeValue = sourceRoot.themeMode;
       if (themeModeValue === "light" || themeModeValue === "dark") {
         localStorage.setItem(THEME_MODE_STORAGE_KEY, themeModeValue);
@@ -1422,6 +1574,7 @@ export default function App() {
       loadPddConfig(false);
       loadWebsiteEntries(false);
       setHiddenSshAliases(readHiddenSshAliases());
+      setSshShortcutMetaMap(readSshShortcutMetaMap());
       setLogTemplates(readLogQueryTemplates());
       setLogSelectedTemplateId(undefined);
       setLogTemplateName("");
@@ -1747,6 +1900,29 @@ export default function App() {
     }
   };
 
+  const updateSshShortcutMeta = (
+    alias: string,
+    patch: Partial<SshShortcutMeta>
+  ): void => {
+    setSshShortcutMetaMap((prev) => {
+      const current = prev[alias] ?? { expireAt: null, remark: "" };
+      const nextExpireAt =
+        patch.expireAt === undefined
+          ? current.expireAt
+          : normalizeSshMetaExpireAt(patch.expireAt);
+      const nextRemark =
+        patch.remark === undefined ? current.remark : normalizeSshMetaRemark(patch.remark);
+      const next = { ...prev };
+      if (!nextExpireAt && !nextRemark) {
+        delete next[alias];
+      } else {
+        next[alias] = { expireAt: nextExpireAt, remark: nextRemark };
+      }
+      persistSshShortcutMetaMap(next);
+      return next;
+    });
+  };
+
   const loadSshShortcuts = async (showToast = true): Promise<void> => {
     setSshLoading(true);
     try {
@@ -1764,6 +1940,15 @@ export default function App() {
         const next = prev.filter((alias) => aliasSet.has(alias));
         if (next.length !== prev.length) {
           localStorage.setItem(SSH_HIDDEN_STORAGE_KEY, JSON.stringify(next));
+        }
+        return next;
+      });
+      setSshShortcutMetaMap((prev) => {
+        const next = Object.fromEntries(
+          Object.entries(prev).filter(([alias]) => aliasSet.has(alias))
+        ) as Record<string, SshShortcutMeta>;
+        if (Object.keys(next).length !== Object.keys(prev).length) {
+          persistSshShortcutMetaMap(next);
         }
         return next;
       });
@@ -1794,15 +1979,13 @@ export default function App() {
           serverAlias: alias,
           baseDir: logBaseDir.trim() || DEFAULT_PLOG_BASE_DIR,
           days: 14,
+          useRootSudo: logUseRootSudo,
         } as PlogListFiltersRequest,
       });
       setLogTypeDirOptions(response.typeDirs || []);
       setLogLogFileOptions(response.logFiles || []);
       setLogSelectedTypeDirs((prev) =>
         prev.filter((item) => (response.typeDirs || []).includes(item))
-      );
-      setLogSelectedLogFiles((prev) =>
-        prev.filter((item) => (response.logFiles || []).includes(item))
       );
       if (showToast) {
         messageApi.success(
@@ -1880,6 +2063,7 @@ export default function App() {
   const applyLogTemplate = (template: LogQueryTemplate): void => {
     const payload = template.payload;
     setLogBaseDir(payload.baseDir || DEFAULT_PLOG_BASE_DIR);
+    setLogUseRootSudo(payload.useRootSudo !== false);
     setLogStartAt(payload.startAt || formatDateTimeText(new Date(Date.now() - 2 * 60 * 60 * 1000)));
     setLogEndAt(payload.endAt || formatDateTimeText(new Date()));
     setLogSelectedTaskTypes(payload.selectedTaskTypes || []);
@@ -1907,6 +2091,7 @@ export default function App() {
     }
     const payload: LogQueryTemplatePayload = {
       baseDir: logBaseDir.trim() || DEFAULT_PLOG_BASE_DIR,
+      useRootSudo: logUseRootSudo,
       startAt: logStartAt.trim(),
       endAt: logEndAt.trim(),
       selectedTaskTypes: [...logSelectedTaskTypes],
@@ -2030,6 +2215,7 @@ export default function App() {
           limit,
           maxFiles: 8,
           sinceAt: logTailSinceAtRef.current,
+          useRootSudo: logUseRootSudo,
         } as PlogTailRequest,
       });
       const seen = logTailSeenKeysRef.current;
@@ -2075,6 +2261,7 @@ export default function App() {
         [
           `实时 tail 运行中`,
           `服务器: ${alias}`,
+          `模式: ${logUseRootSudo ? "sudo" : "普通用户"}`,
           `新增: ${appended.length}`,
           `本轮命中: ${response.matchedLines}`,
           `耗时: ${response.elapsedMs}ms`,
@@ -2111,7 +2298,9 @@ export default function App() {
     logTailSinceAtRef.current = undefined;
     setLogRows([]);
     setLogTailing(true);
-    setLogSummary(`实时 tail 已启动（${alias}），首次拉取中...`);
+    setLogSummary(
+      `实时 tail 已启动（${alias}，${logUseRootSudo ? "sudo" : "普通用户"}），首次拉取中...`
+    );
     await fetchLogTailOnce(true);
     const intervalMs = Math.min(Math.max(logTailIntervalSec, 2), 60) * 1000;
     logTailTimerRef.current = window.setInterval(() => {
@@ -2159,6 +2348,7 @@ export default function App() {
           customFields: filterPayload.customFields,
           limit,
           contextLines: 0,
+          useRootSudo: logUseRootSudo,
         } as PlogQueryRequest,
       });
       setLogRows(response.items || []);
@@ -2171,6 +2361,7 @@ export default function App() {
       });
       const summary = [
         `服务器: ${alias}`,
+        `模式: ${logUseRootSudo ? "sudo" : "普通用户"}`,
         `耗时: ${response.elapsedMs}ms`,
         `扫描文件: ${response.scannedFiles}`,
         `扫描行: ${response.scannedLines}`,
@@ -2191,6 +2382,7 @@ export default function App() {
 
   const resetLogFilters = (): void => {
     stopLogTailing(false);
+    setLogUseRootSudo(true);
     setLogSelectedTaskTypes([]);
     setLogSelectedTypeDirs([]);
     setLogSelectedLogFiles([]);
@@ -2293,6 +2485,15 @@ export default function App() {
         delete next[alias];
         return next;
       });
+      setSshShortcutMetaMap((prev) => {
+        if (!(alias in prev)) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[alias];
+        persistSshShortcutMetaMap(next);
+        return next;
+      });
       await loadSshShortcuts(false);
       messageApi.success(result || `已删除 SSH 快捷连接 ${alias}`);
     } catch (error) {
@@ -2329,6 +2530,7 @@ export default function App() {
     loadPddConfig(false);
     loadWebsiteEntries(false);
     setHiddenSshAliases(readHiddenSshAliases());
+    setSshShortcutMetaMap(readSshShortcutMetaMap());
 
     void (async () => {
       setDetectingIp(true);
@@ -2381,7 +2583,6 @@ export default function App() {
     if (sshShortcuts.length === 0) {
       void loadSshShortcuts(false);
     }
-    void loadLogFilters(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [moduleKey, sshShortcuts.length]);
 
@@ -2404,14 +2605,6 @@ export default function App() {
         : logServerOptions[0]?.value;
     });
   }, [logServerOptions]);
-
-  useEffect(() => {
-    if (moduleKey !== "logs" || !logServerAlias) {
-      return;
-    }
-    void loadLogFilters(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [moduleKey, logServerAlias]);
 
   useEffect(() => {
     if (moduleKey !== "logs") {
@@ -2813,7 +3006,7 @@ export default function App() {
     {
       title: "快捷命令",
       dataIndex: "alias",
-      width: "18%",
+      width: "14%",
       render: (_, record) => (
         <Space>
           <Typography.Text strong>{record.alias}</Typography.Text>
@@ -2825,25 +3018,55 @@ export default function App() {
     {
       title: "Host/IP",
       dataIndex: "hostName",
-      width: "22%",
+      width: "16%",
       render: (_, record) => record.hostName || "-",
     },
     {
       title: "端口",
       dataIndex: "port",
-      width: "8%",
+      width: "6%",
       render: (_, record) => record.port || "-",
     },
     {
       title: "用户",
       dataIndex: "user",
-      width: "10%",
+      width: "8%",
       render: (_, record) => record.user || "-",
+    },
+    {
+      title: "到期时间",
+      key: "expireAt",
+      width: "10%",
+      render: (_, record) => {
+        const expireAt = sshShortcutMetaMap[record.alias]?.expireAt;
+        if (!expireAt) {
+          return "-";
+        }
+        return <Tag color={expireAt < currentDateText ? "error" : "success"}>{expireAt}</Tag>;
+      },
+    },
+    {
+      title: "备注",
+      key: "remark",
+      width: "16%",
+      render: (_, record) => {
+        const remark = sshShortcutMetaMap[record.alias]?.remark;
+        if (!remark) {
+          return "-";
+        }
+        return (
+          <Tooltip title={remark}>
+            <Typography.Text ellipsis style={{ maxWidth: "100%" }}>
+              {remark}
+            </Typography.Text>
+          </Tooltip>
+        );
+      },
     },
     {
       title: "连接状态",
       key: "connectionStatus",
-      width: "14%",
+      width: "10%",
       render: (_, record) => {
         const status = sshConnectionStatusMap[record.alias]?.status ?? "unknown";
         if (status === "success") {
@@ -2858,7 +3081,7 @@ export default function App() {
     {
       title: "显示",
       key: "visibility",
-      width: "8%",
+      width: "6%",
       render: (_, record) => {
         const isHidden = hiddenAliasSet.has(record.alias);
         return (
@@ -2877,7 +3100,7 @@ export default function App() {
     {
       title: "操作",
       key: "actions",
-      width: "20%",
+      width: "14%",
       render: (_, record) => (
         <Space size={6} wrap>
           <Tooltip title={`测试 ${record.alias}`}>
@@ -3576,6 +3799,8 @@ export default function App() {
           expandable={{
             expandedRowRender: (record) => {
               const status = sshConnectionStatusMap[record.alias] ?? makeUnknownSshStatus(record.alias);
+              const meta = sshShortcutMetaMap[record.alias] ?? { expireAt: null, remark: "" };
+              const expired = !!(meta.expireAt && meta.expireAt < currentDateText);
               return (
                 <div className="result-detail-grid">
                   <div className="detail-item">
@@ -3593,6 +3818,41 @@ export default function App() {
                         ? `${record.sourceFile}${record.sourceLine ? `:${record.sourceLine}` : ""}`
                         : "-"}
                     </b>
+                  </div>
+                  <div className="detail-item">
+                    <span>到期时间</span>
+                    <Space direction="vertical" size={6} style={{ width: "100%" }}>
+                      <Input
+                        size="small"
+                        type="date"
+                        value={meta.expireAt || ""}
+                        onChange={(event) =>
+                          updateSshShortcutMeta(record.alias, {
+                            expireAt: event.target.value || null,
+                          })
+                        }
+                      />
+                      {meta.expireAt ? (
+                        <Tag color={expired ? "error" : "success"}>{expired ? "已到期" : "有效中"}</Tag>
+                      ) : (
+                        <Tag>未设置</Tag>
+                      )}
+                    </Space>
+                  </div>
+                  <div className="detail-item">
+                    <span>备注</span>
+                    <Input
+                      size="small"
+                      value={meta.remark}
+                      maxLength={120}
+                      allowClear
+                      placeholder="例如：临时账号、负责人、用途说明"
+                      onChange={(event) =>
+                        updateSshShortcutMeta(record.alias, {
+                          remark: event.target.value,
+                        })
+                      }
+                    />
                   </div>
                   <div className="detail-item">
                     <span>解析状态</span>
@@ -3952,6 +4212,14 @@ export default function App() {
         <Typography.Paragraph type="secondary" className="section-help">
           时间格式：YYYY-MM-DD HH:mm:ss。关键词可输入多个（空格、逗号分隔）。实时 Tail 会持续轮询最近日志并增量追加。
         </Typography.Paragraph>
+        <div className="log-root-switch-row">
+          <Space>
+            <Switch checked={logUseRootSudo} onChange={setLogUseRootSudo} />
+            <Typography.Text>
+              使用 <Typography.Text code>sudo</Typography.Text> 提高权限后查询日志（默认开启）
+            </Typography.Text>
+          </Space>
+        </div>
         <div className="log-template-row">
           <Select
             value={logSelectedTemplateId}
@@ -3997,7 +4265,7 @@ export default function App() {
             value={logBaseDir}
             onChange={(event) => setLogBaseDir(event.target.value)}
             addonBefore="日志根目录"
-            placeholder="~/junziyun-v7/storage/logs/custom"
+            placeholder="/root/junziyun/storage/logs/custom"
           />
           <Input
             value={logStartAt}
@@ -4055,12 +4323,27 @@ export default function App() {
             placeholder="typeDir（目录）"
           />
           <Select
-            mode="multiple"
+            mode="tags"
             allowClear
             value={logSelectedLogFiles}
-            onChange={(value) => setLogSelectedLogFiles(value)}
-            options={logLogFileOptions.map((item) => ({ label: item, value: item }))}
-            placeholder="logFileName（日志名）"
+            onChange={(value) =>
+              setLogSelectedLogFiles(
+                Array.from(
+                  new Set(
+                    value
+                      .map((item) => item.trim())
+                      .filter((item) => item.length > 0)
+                  )
+                )
+              )
+            }
+            options={logVisibleLogFileOptions.map((item) => ({ label: item, value: item }))}
+            placeholder={
+              logSelectedTaskTypes.length > 0
+                ? "logFileName（日志名，可输入；会随任务类型联动）"
+                : "logFileName（日志名，可输入）"
+            }
+            tokenSeparators={[",", "，", " "]}
           />
           <Input
             value={logOrderId}

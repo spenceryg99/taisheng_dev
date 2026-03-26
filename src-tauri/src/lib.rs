@@ -39,7 +39,7 @@ const LOCAL_BACKEND_DIR: &str = "/Users/spenceryg/Documents/taisheng/junziyun-v7
 const LOCAL_FRONTEND_DIR: &str = "/Users/spenceryg/Documents/taisheng/taisheng_web";
 const LOCAL_BACKEND_PORT: u16 = 9528;
 const LOCAL_FRONTEND_PORT: u16 = 9669;
-const DEFAULT_PLOG_BASE_DIR: &str = "~/junziyun-v7/storage/logs/custom";
+const DEFAULT_PLOG_BASE_DIR: &str = "/root/junziyun/storage/logs/custom";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,6 +280,7 @@ struct PlogListFiltersRequest {
     server_alias: String,
     base_dir: Option<String>,
     days: Option<u32>,
+    use_root_sudo: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -331,6 +332,7 @@ struct PlogQueryRequest {
     custom_fields: Option<Vec<PlogCustomFieldRule>>,
     limit: Option<usize>,
     context_lines: Option<usize>,
+    use_root_sudo: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -380,6 +382,7 @@ struct PlogTailRequest {
     limit: Option<usize>,
     max_files: Option<usize>,
     since_at: Option<String>,
+    use_root_sudo: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -888,6 +891,7 @@ fn find_latest_config_backup_file(directory: String) -> Result<String, String> {
 fn plog_list_filters(request: PlogListFiltersRequest) -> Result<PlogListFiltersResponse, String> {
     let server_alias = validate_alias(&request.server_alias)?;
     let base_dir = normalize_remote_base_dir(request.base_dir.as_deref())?;
+    let use_root_sudo = request.use_root_sudo.unwrap_or(true);
     let days = request.days.unwrap_or(7).clamp(1, 60);
     let cutoff_day = (Utc::now().date_naive() - chrono::Duration::days((days - 1) as i64))
         .format("%Y-%m-%d")
@@ -917,12 +921,13 @@ done
         base_dir = shell_single_quote(&base_dir),
         cutoff_day = shell_single_quote(&cutoff_day)
     );
-    let remote_cmd = format!("bash -lc {}", shell_single_quote(&script));
+    let remote_cmd = build_remote_log_shell_command(&script, use_root_sudo);
     let (exit_code, output) = run_ssh_command(server_alias, &remote_cmd)?;
     if exit_code != 0 {
+        let mode = if use_root_sudo { "sudo" } else { "普通用户" };
         return Err(format!(
-            "读取远程日志筛选项失败（exitCode={}）：{}",
-            exit_code, output
+            "读取远程日志筛选项失败（模式={}，exitCode={}）：{}",
+            mode, exit_code, output
         ));
     }
 
@@ -962,6 +967,7 @@ fn plog_query_remote(request: PlogQueryRequest) -> Result<PlogQueryResponse, Str
     let started_at = Instant::now();
     let server_alias = validate_alias(&request.server_alias)?;
     let base_dir = normalize_remote_base_dir(request.base_dir.as_deref())?;
+    let use_root_sudo = request.use_root_sudo.unwrap_or(true);
     let start_dt = parse_query_datetime(&request.start_at, "startAt")?;
     let end_dt = parse_query_datetime(&request.end_at, "endAt")?;
     if start_dt > end_dt {
@@ -1030,12 +1036,13 @@ done | head -n "$MAX_LINES"
         end_day = shell_single_quote(&end_day_text),
         max_lines = max_remote_lines
     );
-    let remote_cmd = format!("bash -lc {}", shell_single_quote(&script));
+    let remote_cmd = build_remote_log_shell_command(&script, use_root_sudo);
     let (exit_code, output) = run_ssh_command(server_alias, &remote_cmd)?;
     if exit_code != 0 {
+        let mode = if use_root_sudo { "sudo" } else { "普通用户" };
         return Err(format!(
-            "执行远程日志查询失败（exitCode={}）：{}",
-            exit_code, output
+            "执行远程日志查询失败（模式={}，exitCode={}）：{}",
+            mode, exit_code, output
         ));
     }
 
@@ -1119,6 +1126,7 @@ fn plog_tail_remote(request: PlogTailRequest) -> Result<PlogTailResponse, String
     let started_at = Instant::now();
     let server_alias = validate_alias(&request.server_alias)?;
     let base_dir = normalize_remote_base_dir(request.base_dir.as_deref())?;
+    let use_root_sudo = request.use_root_sudo.unwrap_or(true);
 
     let task_type_filter = normalize_simple_filter_values(request.task_types, "taskTypes")?;
     let type_dir_filter = normalize_simple_filter_values(request.type_dirs, "typeDirs")?;
@@ -1181,12 +1189,13 @@ done | tail -n "$MAX_TOTAL_LINES"
         per_file_lines = per_file_lines,
         max_total_lines = max_total_lines
     );
-    let remote_cmd = format!("bash -lc {}", shell_single_quote(&script));
+    let remote_cmd = build_remote_log_shell_command(&script, use_root_sudo);
     let (exit_code, output) = run_ssh_command(server_alias, &remote_cmd)?;
     if exit_code != 0 {
+        let mode = if use_root_sudo { "sudo" } else { "普通用户" };
         return Err(format!(
-            "执行实时 tail 查询失败（exitCode={}）：{}",
-            exit_code, output
+            "执行实时 tail 查询失败（模式={}，exitCode={}）：{}",
+            mode, exit_code, output
         ));
     }
 
@@ -2218,6 +2227,16 @@ fn run_ssh_command(server_alias: &str, remote_cmd: &str) -> Result<(i32, String)
         format!("{stdout}\n{stderr}")
     };
     Ok((code, merged))
+}
+
+fn build_remote_log_shell_command(script: &str, use_root_sudo: bool) -> String {
+    let quoted_script = shell_single_quote(script);
+    if use_root_sudo {
+        // Use non-interactive sudo so command fails fast when sudoers is not configured.
+        format!("sudo -n bash -lc {}", quoted_script)
+    } else {
+        format!("bash -lc {}", quoted_script)
+    }
 }
 
 fn normalize_remote_base_dir(base_dir: Option<&str>) -> Result<String, String> {
