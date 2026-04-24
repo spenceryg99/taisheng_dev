@@ -8,15 +8,21 @@
 - 支持多组阿里云账号（AccessKey）
 - 支持多组安全组目标
 - 一键获取当前公网 IPv4，并批量同步到 ECS 安全组入方向规则
+- 支持按白名单分组名覆盖 PolarDB 集群 IP 白名单
 
 ## 已实现能力
 
 - 账号管理：`AccessKeyId`、`AccessKeySecret`、可选 `SecurityToken`
 - 目标管理：必填 `SecurityGroupId` + 描述；可选 `RegionId`、`ruleId`
+- PolarDB 白名单管理：必填 `DBClusterId` + `DBClusterIPArrayName`（白名单分组名），将分组 IP 覆盖为当前公网 IP
 - 规则更新逻辑：
   - 有 `ruleId`：优先直接修改对应规则 `SourceCidrIp`
   - 无 `ruleId`：仅按“描述完全一致”匹配已有规则
   - 不匹配或匹配多条：跳过，不执行修改
+- PolarDB 更新逻辑：
+  - 按白名单分组名精确匹配已有分组
+  - 仅覆盖该分组，不影响其他分组
+  - 分组不存在时跳过，不自动新建
 - 多账号多目标批量执行，返回每条结果和 `RequestId`
 - 本地配置保存（浏览器 localStorage）
 - SSH 配置读取：
@@ -33,6 +39,9 @@
 - `DescribeSecurityGroups`
 - `DescribeSecurityGroupAttribute`
 - `ModifySecurityGroupRule`
+- `DescribeDBClusters`
+- `DescribeDBClusterAccessWhitelist`
+- `ModifyDBClusterAccessWhitelist`
 
 > 所有请求通过阿里云 OpenAPI V3 签名（`ACS3-HMAC-SHA256`）调用。
 

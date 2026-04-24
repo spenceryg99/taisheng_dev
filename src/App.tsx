@@ -56,6 +56,7 @@ type PddViewMode = "manage" | "sync";
 type SshConnectionState = "unknown" | "success" | "failed";
 type LogLevelFilter = "all" | "info" | "error" | "warn" | "unknown";
 type LogQueryMode = "query" | "tail";
+type AliyunTargetType = "ecsSecurityGroup" | "polardbClusterWhitelist";
 
 interface AccountInput {
   id: string;
@@ -70,7 +71,10 @@ interface TargetInput {
   id: string;
   name: string;
   accountId: string;
+  targetType: AliyunTargetType;
   securityGroupId: string;
+  dbClusterId: string;
+  dbClusterIpArrayName: Nullable<string>;
   regionId: Nullable<string>;
   ruleId: Nullable<string>;
   description: Nullable<string>;
@@ -101,7 +105,9 @@ interface TargetSyncResult {
   targetName?: string;
   accountId: string;
   accountName?: string;
-  securityGroupId: string;
+  targetType: AliyunTargetType;
+  resourceId: string;
+  whitelistGroupName?: string | null;
   regionId?: string;
   ruleId?: string;
   action: string;
@@ -443,6 +449,32 @@ const PDD_SYNC_TASK_OPTIONS: { label: string; value: number }[] = [
   { label: "手机号卡订单管理（task 1）", value: 1 },
   { label: "爱宇订单导出（task 2）", value: 2 },
 ];
+const ALIYUN_TARGET_TYPE_OPTIONS: { label: string; value: AliyunTargetType }[] = [
+  { label: "ECS 安全组", value: "ecsSecurityGroup" },
+  { label: "PolarDB 集群白名单", value: "polardbClusterWhitelist" },
+];
+
+function aliyunTargetTypeLabel(targetType: AliyunTargetType): string {
+  return (
+    ALIYUN_TARGET_TYPE_OPTIONS.find((item) => item.value === targetType)?.label || "未知类型"
+  );
+}
+
+function aliyunTargetResourceLabel(targetType: AliyunTargetType): string {
+  return targetType === "polardbClusterWhitelist" ? "DBClusterId" : "SecurityGroupId";
+}
+
+function aliyunTargetMatchFieldLabel(targetType: AliyunTargetType): string {
+  return targetType === "polardbClusterWhitelist" ? "白名单分组名" : "描述（需完全一致）";
+}
+
+function aliyunTargetResourceHint(targetType: AliyunTargetType): string {
+  return targetType === "polardbClusterWhitelist" ? "PolarDB 集群" : "ECS 入方向规则";
+}
+
+function aliyunTargetMatchHint(targetType: AliyunTargetType): string {
+  return targetType === "polardbClusterWhitelist" ? "按分组名覆盖" : "按描述精确匹配";
+}
 
 function uid(prefix: string): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -717,7 +749,10 @@ function blankTarget(accountId: string): TargetInput {
     id: uid("target"),
     name: "",
     accountId,
+    targetType: "ecsSecurityGroup",
     securityGroupId: "",
+    dbClusterId: "",
+    dbClusterIpArrayName: null,
     regionId: null,
     ruleId: null,
     description: null,
@@ -1257,14 +1292,24 @@ export default function App() {
         defaultRegionId: normalizeNullable(item.defaultRegionId),
       }));
 
-      const loadedTargets = (parsed.targets ?? []).map((item) => ({
-        ...blankTarget(loadedAccounts[0]?.id ?? ""),
-        ...item,
-        id: item.id || uid("target"),
-        regionId: normalizeNullable(item.regionId),
-        ruleId: normalizeNullable(item.ruleId),
-        description: normalizeNullable(item.description),
-      }));
+      const loadedTargets = (parsed.targets ?? []).map((item) => {
+        const normalizedTargetType: AliyunTargetType =
+          item.targetType === "polardbClusterWhitelist"
+            ? "polardbClusterWhitelist"
+            : "ecsSecurityGroup";
+        return {
+          ...blankTarget(loadedAccounts[0]?.id ?? ""),
+          ...item,
+          id: item.id || uid("target"),
+          targetType: normalizedTargetType,
+          securityGroupId: String(item.securityGroupId ?? "").trim(),
+          dbClusterId: String(item.dbClusterId ?? "").trim(),
+          dbClusterIpArrayName: normalizeNullable(item.dbClusterIpArrayName),
+          regionId: normalizeNullable(item.regionId),
+          ruleId: normalizeNullable(item.ruleId),
+          description: normalizeNullable(item.description),
+        };
+      });
 
       const ensured = ensureBaseRows(loadedAccounts, loadedTargets);
       setAccounts(ensured.accounts);
@@ -2728,14 +2773,23 @@ export default function App() {
     }
 
     for (const target of targets) {
-      if (!target.securityGroupId.trim()) {
-        return "每个目标都必须填写 SecurityGroupId";
-      }
       if (!target.accountId) {
         return "每个目标都必须绑定账号";
       }
+      if (target.targetType === "polardbClusterWhitelist") {
+        if (!target.dbClusterId.trim()) {
+          return "PolarDB 目标必须填写 DBClusterId";
+        }
+        if (!target.dbClusterIpArrayName?.trim()) {
+          return "PolarDB 目标必须填写白名单分组名";
+        }
+        continue;
+      }
+      if (!target.securityGroupId.trim()) {
+        return "ECS 目标必须填写 SecurityGroupId";
+      }
       if (!target.ruleId && !target.description?.trim()) {
-        return "未填写 ruleId 的目标必须填写描述（且与云上规则描述完全一致）";
+        return "未填写 ruleId 的 ECS 目标必须填写描述（且与云上规则描述完全一致）";
       }
     }
 
@@ -2888,9 +2942,32 @@ export default function App() {
 
   const targetColumns: ColumnsType<TargetInput> = [
     {
+      title: "类型",
+      dataIndex: "targetType",
+      width: "16%",
+      render: (_, record) => (
+        <Select
+          value={record.targetType}
+          options={ALIYUN_TARGET_TYPE_OPTIONS}
+          onChange={(value) =>
+            updateTarget(record.id, {
+              targetType: value,
+              securityGroupId: value === "ecsSecurityGroup" ? record.securityGroupId : "",
+              dbClusterId:
+                value === "polardbClusterWhitelist" ? record.dbClusterId : "",
+              dbClusterIpArrayName:
+                value === "polardbClusterWhitelist" ? record.dbClusterIpArrayName : null,
+              ruleId: value === "ecsSecurityGroup" ? record.ruleId : null,
+              description: value === "ecsSecurityGroup" ? record.description : null,
+            })
+          }
+        />
+      ),
+    },
+    {
       title: "名称",
       dataIndex: "name",
-      width: "18%",
+      width: "14%",
       render: (_, record) => (
         <Input
           value={record.name}
@@ -2902,7 +2979,7 @@ export default function App() {
     {
       title: "账号",
       dataIndex: "accountId",
-      width: "20%",
+      width: "16%",
       render: (_, record) => (
         <Select
           value={record.accountId}
@@ -2912,33 +2989,79 @@ export default function App() {
       ),
     },
     {
-      title: "SecurityGroupId",
-      dataIndex: "securityGroupId",
-      width: "26%",
+      title: "资源 ID",
+      key: "resourceId",
+      width: "22%",
       render: (_, record) => (
-        <Input
-          value={record.securityGroupId}
-          placeholder="sg-xxxx"
-          onChange={(event) =>
-            updateTarget(record.id, { securityGroupId: event.target.value })
-          }
-        />
+        <div className="target-field-card">
+          <div className="target-field-head">
+            <span className="target-field-label">
+              {aliyunTargetResourceLabel(record.targetType)}
+            </span>
+            <span className="target-field-hint">
+              {aliyunTargetResourceHint(record.targetType)}
+            </span>
+          </div>
+          <Input
+            value={
+              record.targetType === "polardbClusterWhitelist"
+                ? record.dbClusterId
+                : record.securityGroupId
+            }
+            placeholder={
+              record.targetType === "polardbClusterWhitelist" ? "pc-xxxx" : "sg-xxxx"
+            }
+            onChange={(event) =>
+              updateTarget(
+                record.id,
+                record.targetType === "polardbClusterWhitelist"
+                  ? { dbClusterId: event.target.value }
+                  : { securityGroupId: event.target.value }
+              )
+            }
+          />
+        </div>
       ),
     },
     {
-      title: "描述（需完全一致）",
-      dataIndex: "description",
-      width: "24%",
+      title: "匹配项",
+      key: "matchField",
+      width: "20%",
       render: (_, record) => (
-        <Input
-          value={record.description || ""}
-          placeholder="与云上规则描述完全一致"
-          onChange={(event) =>
-            updateTarget(record.id, {
-              description: normalizeNullable(event.target.value),
-            })
-          }
-        />
+        <div className="target-field-card">
+          <div className="target-field-head">
+            <span className="target-field-label">
+              {aliyunTargetMatchFieldLabel(record.targetType)}
+            </span>
+            <span className="target-field-hint">
+              {aliyunTargetMatchHint(record.targetType)}
+            </span>
+          </div>
+          <Input
+            value={
+              record.targetType === "polardbClusterWhitelist"
+                ? record.dbClusterIpArrayName || ""
+                : record.description || ""
+            }
+            placeholder={
+              record.targetType === "polardbClusterWhitelist"
+                ? "例如 spenceryg"
+                : "与云上规则描述完全一致"
+            }
+            onChange={(event) =>
+              updateTarget(
+                record.id,
+                record.targetType === "polardbClusterWhitelist"
+                  ? {
+                      dbClusterIpArrayName: normalizeNullable(event.target.value),
+                    }
+                  : {
+                      description: normalizeNullable(event.target.value),
+                    }
+              )
+            }
+          />
+        </div>
       ),
     },
     {
@@ -2974,9 +3097,17 @@ export default function App() {
       render: (_, record) => record.accountName || record.accountId,
     },
     {
-      title: "安全组",
-      dataIndex: "securityGroupId",
-      width: "20%",
+      title: "资源",
+      key: "resourceId",
+      width: "24%",
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text>{record.resourceId || "-"}</Typography.Text>
+          <Typography.Text type="secondary">
+            {aliyunTargetTypeLabel(record.targetType)}
+          </Typography.Text>
+        </Space>
+      ),
     },
     {
       title: "结果",
@@ -2992,7 +3123,7 @@ export default function App() {
     {
       title: "说明",
       dataIndex: "message",
-      width: "40%",
+      width: "36%",
       render: (_, record) => {
         if (record.code) {
           return `[${record.code}] ${record.message}`;
@@ -3550,8 +3681,16 @@ export default function App() {
               expandedRowRender: (record) => (
                 <div className="result-detail-grid">
                   <div className="detail-item">
+                    <span>类型</span>
+                    <b>{aliyunTargetTypeLabel(record.targetType)}</b>
+                  </div>
+                  <div className="detail-item">
                     <span>动作</span>
                     <b>{record.action}</b>
+                  </div>
+                  <div className="detail-item">
+                    <span>白名单分组</span>
+                    <b>{record.whitelistGroupName || "-"}</b>
                   </div>
                   <div className="detail-item">
                     <span>地域</span>
@@ -3663,10 +3802,10 @@ export default function App() {
             </Button>
           </div>
           <Typography.Paragraph type="secondary" className="section-help">
-            只填 SecurityGroupId + 描述即可。描述必须与云上规则完全一致。
+            支持两类目标：ECS 安全组规则，或 PolarDB 集群 IP 白名单分组。
           </Typography.Paragraph>
           <Typography.Paragraph type="secondary" className="section-help">
-            操作：新增目标 / 删除目标
+            ECS 目标按 ruleId 或描述匹配；PolarDB 目标按白名单分组名直接覆盖为本机公网 IP。
           </Typography.Paragraph>
           {showTargetEditor ? (
             <>
@@ -3697,16 +3836,29 @@ export default function App() {
                           })
                         }
                       />
-                      <Input
-                        value={record.ruleId || ""}
-                        placeholder="sgr-xxxx"
-                        addonBefore="ruleId（可选）"
-                        onChange={(event) =>
-                          updateTarget(record.id, {
-                            ruleId: normalizeNullable(event.target.value),
-                          })
-                        }
-                      />
+                      {record.targetType === "ecsSecurityGroup" ? (
+                        <Input
+                          value={record.ruleId || ""}
+                          placeholder="sgr-xxxx"
+                          addonBefore="ruleId（可选）"
+                          onChange={(event) =>
+                            updateTarget(record.id, {
+                              ruleId: normalizeNullable(event.target.value),
+                            })
+                          }
+                        />
+                      ) : (
+                        <Input
+                          value={record.dbClusterIpArrayName || ""}
+                          placeholder="例如 spenceryg"
+                          addonBefore="白名单分组名"
+                          onChange={(event) =>
+                            updateTarget(record.id, {
+                              dbClusterIpArrayName: normalizeNullable(event.target.value),
+                            })
+                          }
+                        />
+                      )}
                     </div>
                   ),
                 }}

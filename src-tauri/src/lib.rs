@@ -24,13 +24,16 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 
 const ECS_VERSION: &str = "2014-05-26";
+const POLARDB_VERSION: &str = "2017-08-01";
 const STS_VERSION: &str = "2015-04-01";
 const STS_HOST: &str = "sts.aliyuncs.com";
+const POLARDB_HOST: &str = "polardb.aliyuncs.com";
 const PDD_DEFAULT_LOGIN_URL: &str = "https://open.pinduoduo.com/application/home";
 const PDD_COOKIE_TEST_URL: &str = "https://mms.pinduoduo.com/";
 const PDD_AUTH_MANAGE_DETAIL_BASE_URL: &str =
     "https://open.pinduoduo.com/application/app/detail/jbxx/sqgl";
-const PDD_OWNER_PAGE_API_URL: &str = "https://open-api.pinduoduo.com/pop/application/white/owner/page";
+const PDD_OWNER_PAGE_API_URL: &str =
+    "https://open-api.pinduoduo.com/pop/application/white/owner/page";
 const PDD_LOGIN_TIMEOUT_MS: u64 = 480_000;
 const PDD_PAGE_CAPTURE_TIMEOUT_MS: u64 = 35_000;
 const PDD_DEFAULT_VERIFY_IDF_ID: &str = "50";
@@ -52,13 +55,33 @@ struct AccountInput {
     default_region_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum TargetType {
+    EcsSecurityGroup,
+    PolardbClusterWhitelist,
+}
+
+impl Default for TargetType {
+    fn default() -> Self {
+        Self::EcsSecurityGroup
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TargetInput {
     id: String,
     name: Option<String>,
     account_id: String,
+    #[serde(default)]
+    target_type: TargetType,
+    #[serde(default)]
     security_group_id: String,
+    #[serde(default)]
+    db_cluster_id: Option<String>,
+    #[serde(default)]
+    db_cluster_ip_array_name: Option<String>,
     region_id: Option<String>,
     rule_id: Option<String>,
     ip_protocol: Option<String>,
@@ -113,7 +136,9 @@ struct TargetSyncResult {
     target_name: Option<String>,
     account_id: String,
     account_name: Option<String>,
-    security_group_id: String,
+    target_type: TargetType,
+    resource_id: String,
+    whitelist_group_name: Option<String>,
     region_id: Option<String>,
     rule_id: Option<String>,
     action: String,
@@ -444,6 +469,12 @@ struct SecurityRule {
     description: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct PolardbWhitelistGroup {
+    name: String,
+    security_ips: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppWorldsIpData {
@@ -731,12 +762,16 @@ async fn sync_all(request: SyncRequest) -> Result<SyncResponse, String> {
     let mut results = Vec::with_capacity(request.targets.len());
     for target in request.targets {
         let Some(account) = account_map.get(&target.account_id) else {
+            let resource_id = target_resource_id(&target);
+            let whitelist_group_name = target_whitelist_group_name(&target);
             results.push(TargetSyncResult {
                 target_id: target.id,
                 target_name: target.name,
                 account_id: target.account_id,
                 account_name: None,
-                security_group_id: target.security_group_id,
+                target_type: target.target_type,
+                resource_id,
+                whitelist_group_name,
                 region_id: target.region_id,
                 rule_id: target.rule_id,
                 action: "failed".to_string(),
@@ -759,12 +794,16 @@ async fn sync_all(request: SyncRequest) -> Result<SyncResponse, String> {
                 results.push(result);
             }
             Err(err) => {
+                let resource_id = target_resource_id(&target);
+                let whitelist_group_name = target_whitelist_group_name(&target);
                 results.push(TargetSyncResult {
                     target_id: target.id,
                     target_name: target.name,
                     account_id: account.id.clone(),
                     account_name,
-                    security_group_id: target.security_group_id,
+                    target_type: target.target_type,
+                    resource_id,
+                    whitelist_group_name,
                     region_id: target.region_id.clone(),
                     rule_id: target.rule_id.clone(),
                     action: "failed".to_string(),
@@ -824,7 +863,8 @@ fn write_text_file(path: String, content: String) -> Result<String, String> {
         fs::create_dir_all(parent)
             .map_err(|err| format!("创建目录失败：{} ({err})", parent.display()))?;
     }
-    fs::write(&target, content).map_err(|err| format!("写入文件失败：{} ({err})", target.display()))?;
+    fs::write(&target, content)
+        .map_err(|err| format!("写入文件失败：{} ({err})", target.display()))?;
     Ok(target.display().to_string())
 }
 
@@ -852,7 +892,8 @@ fn find_latest_config_backup_file(directory: String) -> Result<String, String> {
     }
 
     let mut latest: Option<(PathBuf, std::time::SystemTime, String)> = None;
-    let entries = fs::read_dir(&dir).map_err(|err| format!("读取目录失败：{} ({err})", dir.display()))?;
+    let entries =
+        fs::read_dir(&dir).map_err(|err| format!("读取目录失败：{} ({err})", dir.display()))?;
     for entry in entries {
         let item = entry.map_err(|err| format!("读取目录项失败：{} ({err})", dir.display()))?;
         let path = item.path();
@@ -873,7 +914,8 @@ fn find_latest_config_backup_file(directory: String) -> Result<String, String> {
                 latest = Some((path, modified, file_name));
             }
             Some((_, latest_time, latest_name)) => {
-                if modified > *latest_time || (modified == *latest_time && file_name > *latest_name) {
+                if modified > *latest_time || (modified == *latest_time && file_name > *latest_name)
+                {
                     latest = Some((path, modified, file_name));
                 }
             }
@@ -924,7 +966,11 @@ done
     let remote_cmd = build_remote_log_shell_command(&script, use_root_sudo);
     let (exit_code, output) = run_ssh_command(server_alias, &remote_cmd)?;
     if exit_code != 0 {
-        let mode = if use_root_sudo { "sudo" } else { "普通用户" };
+        let mode = if use_root_sudo {
+            "sudo"
+        } else {
+            "普通用户"
+        };
         return Err(format!(
             "读取远程日志筛选项失败（模式={}，exitCode={}）：{}",
             mode, exit_code, output
@@ -990,7 +1036,10 @@ fn plog_query_remote(request: PlogQueryRequest) -> Result<PlogQueryResponse, Str
         .unwrap_or("all")
         .trim()
         .to_lowercase();
-    if !matches!(level_filter.as_str(), "all" | "info" | "error" | "warn" | "unknown") {
+    if !matches!(
+        level_filter.as_str(),
+        "all" | "info" | "error" | "warn" | "unknown"
+    ) {
         return Err("level 仅支持 all/info/error/warn/unknown".to_string());
     }
 
@@ -1039,7 +1088,11 @@ done | head -n "$MAX_LINES"
     let remote_cmd = build_remote_log_shell_command(&script, use_root_sudo);
     let (exit_code, output) = run_ssh_command(server_alias, &remote_cmd)?;
     if exit_code != 0 {
-        let mode = if use_root_sudo { "sudo" } else { "普通用户" };
+        let mode = if use_root_sudo {
+            "sudo"
+        } else {
+            "普通用户"
+        };
         return Err(format!(
             "执行远程日志查询失败（模式={}，exitCode={}）：{}",
             mode, exit_code, output
@@ -1144,7 +1197,10 @@ fn plog_tail_remote(request: PlogTailRequest) -> Result<PlogTailResponse, String
         .unwrap_or("all")
         .trim()
         .to_lowercase();
-    if !matches!(level_filter.as_str(), "all" | "info" | "error" | "warn" | "unknown") {
+    if !matches!(
+        level_filter.as_str(),
+        "all" | "info" | "error" | "warn" | "unknown"
+    ) {
         return Err("level 仅支持 all/info/error/warn/unknown".to_string());
     }
 
@@ -1192,7 +1248,11 @@ done | tail -n "$MAX_TOTAL_LINES"
     let remote_cmd = build_remote_log_shell_command(&script, use_root_sudo);
     let (exit_code, output) = run_ssh_command(server_alias, &remote_cmd)?;
     if exit_code != 0 {
-        let mode = if use_root_sudo { "sudo" } else { "普通用户" };
+        let mode = if use_root_sudo {
+            "sudo"
+        } else {
+            "普通用户"
+        };
         return Err(format!(
             "执行实时 tail 查询失败（模式={}，exitCode={}）：{}",
             mode, exit_code, output
@@ -1908,11 +1968,8 @@ fn prepare_git_commit_context(file_path: &Path) -> Result<GitCommitContext, Stri
     let file_dir = file_path
         .parent()
         .ok_or_else(|| format!("无法识别文件目录：{}", file_path.display()))?;
-    let repo_root_text = run_git_capture_output(
-        file_dir,
-        &["rev-parse", "--show-toplevel"],
-        "定位 Git 仓库",
-    )?;
+    let repo_root_text =
+        run_git_capture_output(file_dir, &["rev-parse", "--show-toplevel"], "定位 Git 仓库")?;
     let repo_root = PathBuf::from(repo_root_text.trim());
     let branch = run_git_capture_output(
         &repo_root,
@@ -1960,7 +2017,13 @@ fn commit_single_file(
     );
     run_git_command(
         &context.repo_root,
-        &["commit", "-m", &commit_message, "--", &context.relative_text],
+        &[
+            "commit",
+            "-m",
+            &commit_message,
+            "--",
+            &context.relative_text,
+        ],
         "提交目标文件改动",
     )?;
 
@@ -1996,7 +2059,11 @@ fn run_git_command(repo_root: &Path, args: &[&str], context: &str) -> Result<(),
     Err(format!("{context}失败：{detail}"))
 }
 
-fn run_git_capture_output(repo_root: &Path, args: &[&str], context: &str) -> Result<String, String> {
+fn run_git_capture_output(
+    repo_root: &Path,
+    args: &[&str],
+    context: &str,
+) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -2323,10 +2390,7 @@ fn normalize_custom_field_rules(
         normalized.push(NormalizedPlogCustomFieldRule {
             name: name.to_string(),
             keys,
-            contains: normalize_key_filter_value(
-                rule.contains,
-                &format!("{field}.contains"),
-            )?,
+            contains: normalize_key_filter_value(rule.contains, &format!("{field}.contains"))?,
         });
     }
     if normalized.len() > 12 {
@@ -2335,7 +2399,10 @@ fn normalize_custom_field_rules(
     Ok(normalized)
 }
 
-fn normalize_key_filter_value(value: Option<String>, field_name: &str) -> Result<Option<String>, String> {
+fn normalize_key_filter_value(
+    value: Option<String>,
+    field_name: &str,
+) -> Result<Option<String>, String> {
     let Some(raw) = value else {
         return Ok(None);
     };
@@ -2400,7 +2467,14 @@ fn build_plog_item_if_match(
     );
     let order_no = extract_string_with_candidates(
         payload_json.as_ref(),
-        &["orderid", "$orderid", "order_sn", "$order_number", "order_no", "$order_sn"],
+        &[
+            "orderid",
+            "$orderid",
+            "order_sn",
+            "$order_number",
+            "order_no",
+            "$order_sn",
+        ],
     );
     let ext_order_id = extract_string_with_candidates(
         payload_json.as_ref(),
@@ -2433,7 +2507,8 @@ fn build_plog_item_if_match(
     let mut custom_fields = BTreeMap::new();
     let payload_lower = payload.to_lowercase();
     for rule in custom_field_rules {
-        let value = extract_string_with_candidates_case_insensitive(payload_json.as_ref(), &rule.keys);
+        let value =
+            extract_string_with_candidates_case_insensitive(payload_json.as_ref(), &rule.keys);
         if let Some(value_text) = value.as_ref() {
             custom_fields.insert(rule.name.clone(), value_text.clone());
         }
@@ -2550,7 +2625,10 @@ fn parse_payload_json_object(payload: &str) -> Option<serde_json::Map<String, Va
     value.as_object().cloned()
 }
 
-fn detect_plog_level(payload_json: Option<&serde_json::Map<String, Value>>, payload: &str) -> String {
+fn detect_plog_level(
+    payload_json: Option<&serde_json::Map<String, Value>>,
+    payload: &str,
+) -> String {
     if let Some(map) = payload_json {
         if map.contains_key("error") {
             return "error".to_string();
@@ -2575,7 +2653,10 @@ fn detect_plog_level(payload_json: Option<&serde_json::Map<String, Value>>, payl
     "unknown".to_string()
 }
 
-fn extract_plog_message(payload_json: Option<&serde_json::Map<String, Value>>, payload: &str) -> String {
+fn extract_plog_message(
+    payload_json: Option<&serde_json::Map<String, Value>>,
+    payload: &str,
+) -> String {
     if let Some(map) = payload_json {
         for key in ["msg", "message", "info", "error"] {
             if let Some(value) = map.get(key).and_then(value_to_text) {
@@ -2726,7 +2807,43 @@ fn matches_key_filters(
         && check(channel, &filters.channel)
 }
 
+fn target_resource_id(target: &TargetInput) -> String {
+    match target.target_type {
+        TargetType::PolardbClusterWhitelist => target
+            .db_cluster_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("")
+            .to_string(),
+        TargetType::EcsSecurityGroup => target.security_group_id.trim().to_string(),
+    }
+}
+
+fn target_whitelist_group_name(target: &TargetInput) -> Option<String> {
+    match target.target_type {
+        TargetType::PolardbClusterWhitelist => {
+            trim_to_option(&target.db_cluster_ip_array_name).map(ToString::to_string)
+        }
+        TargetType::EcsSecurityGroup => None,
+    }
+}
+
 async fn sync_single_target(
+    client: &AlibabaOpenApiClient,
+    account: &AccountInput,
+    target: &TargetInput,
+    cidr: &str,
+) -> Result<TargetSyncResult, ApiError> {
+    match target.target_type {
+        TargetType::EcsSecurityGroup => sync_ecs_target(client, account, target, cidr).await,
+        TargetType::PolardbClusterWhitelist => {
+            sync_polardb_whitelist_target(client, account, target, cidr).await
+        }
+    }
+}
+
+async fn sync_ecs_target(
     client: &AlibabaOpenApiClient,
     account: &AccountInput,
     target: &TargetInput,
@@ -2821,7 +2938,9 @@ fn skipped_result(
         target_name: target.name.clone(),
         account_id: target.account_id.clone(),
         account_name: None,
-        security_group_id: target.security_group_id.clone(),
+        target_type: target.target_type.clone(),
+        resource_id: target_resource_id(target),
+        whitelist_group_name: target_whitelist_group_name(target),
         region_id: Some(region_id.to_string()),
         rule_id,
         action: "skipped".to_string(),
@@ -2863,7 +2982,9 @@ async fn update_existing_rule(
             target_name: target.name.clone(),
             account_id: target.account_id.clone(),
             account_name: None,
-            security_group_id: target.security_group_id.clone(),
+            target_type: target.target_type.clone(),
+            resource_id: target_resource_id(target),
+            whitelist_group_name: target_whitelist_group_name(target),
             region_id: Some(region_id.to_string()),
             rule_id: Some(rule_id),
             action: "noop".to_string(),
@@ -2899,7 +3020,9 @@ async fn update_existing_rule(
         target_name: target.name.clone(),
         account_id: target.account_id.clone(),
         account_name: None,
-        security_group_id: target.security_group_id.clone(),
+        target_type: target.target_type.clone(),
+        resource_id: target_resource_id(target),
+        whitelist_group_name: target_whitelist_group_name(target),
         region_id: Some(region_id.to_string()),
         rule_id: Some(rule_id),
         action,
@@ -2911,6 +3034,291 @@ async fn update_existing_rule(
         code: None,
         message: format!("规则已更新为 {}", cidr),
     })
+}
+
+async fn sync_polardb_whitelist_target(
+    client: &AlibabaOpenApiClient,
+    account: &AccountInput,
+    target: &TargetInput,
+    cidr: &str,
+) -> Result<TargetSyncResult, ApiError> {
+    let db_cluster_id = trim_to_option(&target.db_cluster_id).ok_or_else(|| {
+        ApiError::new("DBClusterIdMissing", "PolarDB 目标未填写 DBClusterId", None)
+    })?;
+    let group_name = trim_to_option(&target.db_cluster_ip_array_name).ok_or_else(|| {
+        ApiError::new(
+            "DBClusterIPArrayNameMissing",
+            "PolarDB 目标未填写白名单分组名",
+            None,
+        )
+    })?;
+    let region_id = resolve_polardb_target_region(client, account, target, db_cluster_id).await?;
+    let whitelist_groups =
+        describe_polardb_access_whitelist(client, account, db_cluster_id).await?;
+
+    let mut matched_groups: Vec<PolardbWhitelistGroup> = whitelist_groups
+        .into_iter()
+        .filter(|group| group.name == group_name)
+        .collect();
+
+    match matched_groups.len() {
+        0 => Ok(TargetSyncResult {
+            target_id: target.id.clone(),
+            target_name: target.name.clone(),
+            account_id: target.account_id.clone(),
+            account_name: None,
+            target_type: target.target_type.clone(),
+            resource_id: target_resource_id(target),
+            whitelist_group_name: Some(group_name.to_string()),
+            region_id: Some(region_id),
+            rule_id: None,
+            action: "skipped".to_string(),
+            success: true,
+            request_id: None,
+            code: None,
+            message: format!(
+                "未找到名为“{}”的 PolarDB 白名单分组，未执行修改",
+                group_name
+            ),
+        }),
+        1 => {
+            let current_group = matched_groups.remove(0);
+            let current_cidrs = current_group
+                .security_ips
+                .as_deref()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            if current_cidrs.len() == 1 && current_cidrs[0] == cidr {
+                return Ok(TargetSyncResult {
+                    target_id: target.id.clone(),
+                    target_name: target.name.clone(),
+                    account_id: target.account_id.clone(),
+                    account_name: None,
+                    target_type: target.target_type.clone(),
+                    resource_id: target_resource_id(target),
+                    whitelist_group_name: Some(group_name.to_string()),
+                    region_id: Some(region_id),
+                    rule_id: None,
+                    action: "noop".to_string(),
+                    success: true,
+                    request_id: None,
+                    code: None,
+                    message: "白名单分组 IP 已是最新，无需更新".to_string(),
+                });
+            }
+
+            let request_id =
+                modify_polardb_access_whitelist(client, account, db_cluster_id, group_name, cidr)
+                    .await?;
+
+            Ok(TargetSyncResult {
+                target_id: target.id.clone(),
+                target_name: target.name.clone(),
+                account_id: target.account_id.clone(),
+                account_name: None,
+                target_type: target.target_type.clone(),
+                resource_id: target_resource_id(target),
+                whitelist_group_name: Some(group_name.to_string()),
+                region_id: Some(region_id),
+                rule_id: None,
+                action: "modified_whitelist".to_string(),
+                success: true,
+                request_id: Some(request_id),
+                code: None,
+                message: format!("白名单分组已覆盖为 {}", cidr),
+            })
+        }
+        _ => Ok(TargetSyncResult {
+            target_id: target.id.clone(),
+            target_name: target.name.clone(),
+            account_id: target.account_id.clone(),
+            account_name: None,
+            target_type: target.target_type.clone(),
+            resource_id: target_resource_id(target),
+            whitelist_group_name: Some(group_name.to_string()),
+            region_id: Some(region_id),
+            rule_id: None,
+            action: "skipped".to_string(),
+            success: true,
+            request_id: None,
+            code: None,
+            message: format!(
+                "白名单分组“{}”匹配到多条记录（{}条），未执行修改",
+                group_name,
+                matched_groups.len() + 1
+            ),
+        }),
+    }
+}
+
+async fn describe_polardb_access_whitelist(
+    client: &AlibabaOpenApiClient,
+    account: &AccountInput,
+    db_cluster_id: &str,
+) -> Result<Vec<PolardbWhitelistGroup>, ApiError> {
+    let mut params = BTreeMap::new();
+    params.insert("DBClusterId".to_string(), db_cluster_id.to_string());
+
+    let response = client
+        .call_rpc_json(
+            POLARDB_HOST,
+            "DescribeDBClusterAccessWhitelist",
+            POLARDB_VERSION,
+            account,
+            &params,
+        )
+        .await?;
+
+    let groups = response
+        .pointer("/Items/DBClusterIPArray")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(groups
+        .into_iter()
+        .filter_map(|group| {
+            let name = group
+                .get("DBClusterIPArrayName")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?
+                .to_string();
+            let security_ips = group
+                .get("SecurityIps")
+                .and_then(Value::as_str)
+                .or_else(|| group.get("SecurityIPList").and_then(Value::as_str))
+                .map(ToString::to_string);
+            Some(PolardbWhitelistGroup { name, security_ips })
+        })
+        .collect())
+}
+
+async fn modify_polardb_access_whitelist(
+    client: &AlibabaOpenApiClient,
+    account: &AccountInput,
+    db_cluster_id: &str,
+    group_name: &str,
+    cidr: &str,
+) -> Result<String, ApiError> {
+    let mut params = BTreeMap::new();
+    params.insert("DBClusterId".to_string(), db_cluster_id.to_string());
+    params.insert("WhiteListType".to_string(), "IP".to_string());
+    params.insert("ModifyMode".to_string(), "Cover".to_string());
+    params.insert("DBClusterIPArrayName".to_string(), group_name.to_string());
+    params.insert("SecurityIps".to_string(), cidr.to_string());
+
+    let response = client
+        .call_rpc_json(
+            POLARDB_HOST,
+            "ModifyDBClusterAccessWhitelist",
+            POLARDB_VERSION,
+            account,
+            &params,
+        )
+        .await?;
+
+    Ok(response
+        .get("RequestId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string())
+}
+
+async fn resolve_polardb_target_region(
+    client: &AlibabaOpenApiClient,
+    account: &AccountInput,
+    target: &TargetInput,
+    db_cluster_id: &str,
+) -> Result<String, ApiError> {
+    if let Some(region_id) = trim_to_option(&target.region_id) {
+        return Ok(region_id.to_string());
+    }
+
+    if let Some(region_id) = trim_to_option(&account.default_region_id) {
+        if polardb_cluster_exists_in_region(client, account, region_id, db_cluster_id).await? {
+            return Ok(region_id.to_string());
+        }
+    }
+
+    discover_polardb_region_by_cluster(client, account, db_cluster_id).await
+}
+
+async fn discover_polardb_region_by_cluster(
+    client: &AlibabaOpenApiClient,
+    account: &AccountInput,
+    db_cluster_id: &str,
+) -> Result<String, ApiError> {
+    let regions = describe_regions(client, account).await?;
+    let mut first_non_not_found_error: Option<ApiError> = None;
+
+    for region in regions {
+        match polardb_cluster_exists_in_region(client, account, &region, db_cluster_id).await {
+            Ok(true) => return Ok(region),
+            Ok(false) => continue,
+            Err(err) => {
+                if err.code.contains("InvalidRegionId") {
+                    continue;
+                }
+                if first_non_not_found_error.is_none() {
+                    first_non_not_found_error = Some(err);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_non_not_found_error {
+        return Err(err);
+    }
+
+    Err(ApiError::new(
+        "DBClusterNotFound",
+        format!("没有在任何地域找到 PolarDB 集群 {}", db_cluster_id),
+        None,
+    ))
+}
+
+async fn polardb_cluster_exists_in_region(
+    client: &AlibabaOpenApiClient,
+    account: &AccountInput,
+    region_id: &str,
+    db_cluster_id: &str,
+) -> Result<bool, ApiError> {
+    let mut params = BTreeMap::new();
+    params.insert("RegionId".to_string(), region_id.to_string());
+    params.insert("DBClusterIds".to_string(), db_cluster_id.to_string());
+    params.insert("PageSize".to_string(), "30".to_string());
+    params.insert("PageNumber".to_string(), "1".to_string());
+
+    let response = client
+        .call_rpc_json(
+            POLARDB_HOST,
+            "DescribeDBClusters",
+            POLARDB_VERSION,
+            account,
+            &params,
+        )
+        .await?;
+
+    let clusters = response
+        .pointer("/Items/DBCluster")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(clusters.iter().any(|cluster| {
+        cluster
+            .get("DBClusterId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id == db_cluster_id)
+    }))
 }
 
 async fn resolve_target_region(
@@ -3882,7 +4290,11 @@ fn delete_ssh_alias_from_config(alias: &str) -> Result<String, String> {
 
     let content = fs::read_to_string(&source_path)
         .map_err(|err| format!("读取 SSH 配置失败：{} ({err})", source_path.display()))?;
-    let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let line_ending = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let had_trailing_newline = content.ends_with('\n');
     let mut lines = content.lines().map(ToString::to_string).collect::<Vec<_>>();
 
@@ -4107,17 +4519,18 @@ fn run_pdd_login_flow(request: PddLoginRequest) -> Result<PddLoginResponse, Stri
         ),
     );
     let webdriver_base_url = format!("http://127.0.0.1:{port}");
-    let wd_config = wait_and_create_webdriver_session(
-        &webdriver_base_url,
-        &chrome_binary,
-        &profile_dir,
-    )?;
+    let wd_config =
+        wait_and_create_webdriver_session(&webdriver_base_url, &chrome_binary, &profile_dir)?;
     let wd = WdClient::new(wd_config)?;
     append_pdd_login_log(&login_log_path, "[webdriver] session created");
-    let login_result = execute_pdd_login_flow_with_wd(&wd, &request, &captures_dir, &login_log_path);
+    let login_result =
+        execute_pdd_login_flow_with_wd(&wd, &request, &captures_dir, &login_log_path);
 
     if login_result.is_err() {
-        append_pdd_login_log(&login_log_path, "[cleanup] login failed, closing webdriver session");
+        append_pdd_login_log(
+            &login_log_path,
+            "[cleanup] login failed, closing webdriver session",
+        );
         let _ = wd.delete_session();
     } else {
         append_pdd_login_log(
@@ -4222,8 +4635,8 @@ fn resolve_pdd_chrome_executable() -> Result<String, String> {
 }
 
 fn reserve_local_port() -> Result<u16, String> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|err| format!("分配本地端口失败：{err}"))?;
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|err| format!("分配本地端口失败：{err}"))?;
     let port = listener
         .local_addr()
         .map_err(|err| format!("读取本地端口失败：{err}"))?
@@ -4370,7 +4783,10 @@ impl WdClient {
         let url = self.endpoint(sub_path);
         let (status, payload) = self.send_raw(method, &url, body.as_ref())?;
         if !status.is_success() {
-            return Err(format!("WebDriver 命令失败：{}", extract_webdriver_error(&payload)));
+            return Err(format!(
+                "WebDriver 命令失败：{}",
+                extract_webdriver_error(&payload)
+            ));
         }
         Ok(payload.get("value").cloned().unwrap_or(Value::Null))
     }
@@ -4442,7 +4858,10 @@ impl WdClient {
         if error == "no such element" {
             return Ok(None);
         }
-        Err(format!("查找元素失败：{}", extract_webdriver_error(&payload)))
+        Err(format!(
+            "查找元素失败：{}",
+            extract_webdriver_error(&payload)
+        ))
     }
 
     fn element_displayed(&self, element_id: &str) -> Result<bool, String> {
@@ -4572,12 +4991,19 @@ fn execute_pdd_login_flow_with_wd(
     ensure_navigate_to_url(wd, &request.login_url, Duration::from_secs(20))?;
     append_pdd_login_log(
         login_log_path,
-        &format!("[flow] navigated login current={}", wd.current_url().unwrap_or_default()),
+        &format!(
+            "[flow] navigated login current={}",
+            wd.current_url().unwrap_or_default()
+        ),
     );
     thread::sleep(Duration::from_millis(800));
 
     let mut already_logged_in = false;
-    if wd.current_url()?.to_lowercase().contains("open.pinduoduo.com") {
+    if wd
+        .current_url()?
+        .to_lowercase()
+        .contains("open.pinduoduo.com")
+    {
         already_logged_in = !has_home_login_button(wd)?;
     }
     append_pdd_login_log(
@@ -4593,13 +5019,8 @@ fn execute_pdd_login_flow_with_wd(
             fill_credentials(wd, &request.account, &request.password)?;
             click_login_button(wd)?;
             thread::sleep(Duration::from_millis(1200));
-            let slider_result = handle_slider_if_needed(
-                wd,
-                captures_dir,
-                request.ocr_key.as_deref(),
-                3,
-                120,
-            )?;
+            let slider_result =
+                handle_slider_if_needed(wd, captures_dir, request.ocr_key.as_deref(), 3, 120)?;
             append_pdd_login_log(
                 login_log_path,
                 &format!(
@@ -4625,9 +5046,7 @@ fn execute_pdd_login_flow_with_wd(
         Duration::from_millis(PDD_LOGIN_TIMEOUT_MS),
         &request.login_url,
     )? {
-        return Err(
-            "等待登录成功超时：右上角“登录”按钮仍存在，请先完成滑块并确认登录".to_string(),
-        );
+        return Err("等待登录成功超时：右上角“登录”按钮仍存在，请先完成滑块并确认登录".to_string());
     }
 
     install_target_api_capture_hook(wd, PDD_OWNER_PAGE_API_URL)?;
@@ -4768,8 +5187,12 @@ fn solve_slider_once(
         Duration::from_secs(8),
     )?
     .ok_or_else(|| "未找到滑块背景图".to_string())?;
-    let item_id = find_visible(wd, &[("css selector", ".slider-item")], Duration::from_secs(8))?
-        .ok_or_else(|| "未找到滑块拼图".to_string())?;
+    let item_id = find_visible(
+        wd,
+        &[("css selector", ".slider-item")],
+        Duration::from_secs(8),
+    )?
+    .ok_or_else(|| "未找到滑块拼图".to_string())?;
     let handle_id = find_visible(
         wd,
         &[("css selector", "#slide-button")],
@@ -4783,8 +5206,8 @@ fn solve_slider_once(
         .map_err(|err| format!("写入滑块截图失败：{} ({err})", shot_path.display()))?;
 
     let ocr_result = call_slider_ocr(&image_png, ocr_key)?;
-    let verify_distance = parse_first_number(&ocr_result)
-        .ok_or_else(|| format!("OCR 无法提取距离：{ocr_result}"))?;
+    let verify_distance =
+        parse_first_number(&ocr_result).ok_or_else(|| format!("OCR 无法提取距离：{ocr_result}"))?;
     let dom_bg_width = wd.element_rect(&bg_id)?.width;
     let dom_item_width = wd.element_rect(&item_id)?.width;
     if dom_bg_width <= 0.0 {
@@ -4853,7 +5276,10 @@ fn call_slider_ocr(image_png: &[u8], ocr_key: &str) -> Result<String, String> {
             payload
         ));
     }
-    let code = payload.get("code").and_then(Value::as_i64).unwrap_or_default();
+    let code = payload
+        .get("code")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
     if code != 200 {
         return Err(format!("OCR 识别失败: {payload}"));
     }
@@ -5004,7 +5430,11 @@ fn click_slider_refresh_if_exists(wd: &WdClient) {
     }
 }
 
-fn wait_for_login_success(wd: &WdClient, timeout: Duration, home_url: &str) -> Result<bool, String> {
+fn wait_for_login_success(
+    wd: &WdClient,
+    timeout: Duration,
+    home_url: &str,
+) -> Result<bool, String> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if detect_logged_in_on_home(wd, home_url)? {
@@ -5024,7 +5454,11 @@ fn detect_logged_in_on_home(wd: &WdClient, home_url: &str) -> Result<bool, Strin
     Ok(!has_home_login_button(wd)?)
 }
 
-fn ensure_navigate_to_url(wd: &WdClient, target_url: &str, timeout: Duration) -> Result<(), String> {
+fn ensure_navigate_to_url(
+    wd: &WdClient,
+    target_url: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let start = std::time::Instant::now();
     let target_host = extract_url_host(target_url);
     let mut last_url = String::new();
@@ -5069,7 +5503,11 @@ fn ensure_navigate_to_url(wd: &WdClient, target_url: &str, timeout: Duration) ->
     };
     Err(format!(
         "浏览器未能跳转到目标地址：{target_url}，当前地址：{}{}",
-        if last_url.is_empty() { "<unknown>" } else { &last_url },
+        if last_url.is_empty() {
+            "<unknown>"
+        } else {
+            &last_url
+        },
         err_suffix
     ))
 }
@@ -5146,7 +5584,10 @@ for (const container of topContainers) {
 
 return false;
 "#;
-    Ok(wd.execute_script(script, Vec::new())?.as_bool().unwrap_or(true))
+    Ok(wd
+        .execute_script(script, Vec::new())?
+        .as_bool()
+        .unwrap_or(true))
 }
 
 fn ensure_login_form_ready(wd: &WdClient) -> Result<bool, String> {
@@ -5218,7 +5659,10 @@ fn fill_credentials(wd: &WdClient, account: &str, password: &str) -> Result<(), 
 fn click_login_button(wd: &WdClient) -> Result<(), String> {
     let login_locators = [
         ("css selector", "button[type='submit']"),
-        ("xpath", r#"//button[contains(normalize-space(.),'立即登录')]"#),
+        (
+            "xpath",
+            r#"//button[contains(normalize-space(.),'立即登录')]"#,
+        ),
         ("xpath", r#"//button[contains(normalize-space(.),'登录')]"#),
         ("css selector", ".login-btn"),
         ("css selector", ".submit-btn"),
@@ -5474,9 +5918,7 @@ return state.records
         }
         thread::sleep(Duration::from_millis(800));
     }
-    Err(format!(
-        "进入详情页后未监听到目标接口响应：{target_url}"
-    ))
+    Err(format!("进入详情页后未监听到目标接口响应：{target_url}"))
 }
 
 fn extract_owner_mall_list(payload: &Value) -> Vec<PddOwnerMallItem> {
@@ -5562,10 +6004,7 @@ fn collect_owner_mall_entries(
     }
 }
 
-fn find_first_text(
-    map: &serde_json::Map<String, Value>,
-    keys: &[&str],
-) -> Option<String> {
+fn find_first_text(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
     for key in keys {
         if let Some(value) = map.get(*key) {
             if let Some(text) = json_value_to_text(value) {

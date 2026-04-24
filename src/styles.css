@@ -973,6 +973,50 @@ body {
   width: 100%;
 }
 
+.target-field-card {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.target-field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.target-field-label {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  padding: 3px 8px;
+  border: 1px solid #bfd1ef;
+  border-radius: 999px;
+  background: #eef4ff;
+  color: #1d4ed8;
+  font-family: "IBM Plex Mono", "Menlo", "Monaco", monospace;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.target-field-hint {
+  min-width: 0;
+  color: #6b7f9e;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.1;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.target-field-card .ant-input {
+  font-family: "IBM Plex Mono", "Menlo", "Monaco", monospace;
+}
+
 .pdd-login-collapse.ant-collapse {
   border: 1px solid #d5e3f8;
   border-radius: 10px;
@@ -1764,6 +1808,16 @@ body {
   border-color: #2b4d75 !important;
   background: #193455 !important;
   color: #a8c1e2;
+}
+
+.app-layout.theme-dark .target-field-label {
+  border-color: #315c8f;
+  background: #173357;
+  color: #93c5fd;
+}
+
+.app-layout.theme-dark .target-field-hint {
+  color: #8fb0d8;
 }
 
 .app-layout.theme-dark .app-content .ant-btn {
