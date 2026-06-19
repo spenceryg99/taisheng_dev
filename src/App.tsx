@@ -8,6 +8,7 @@ import {
   Drawer,
   Input,
   Layout,
+  Modal,
   Popconfirm,
   Segmented,
   Select,
@@ -116,6 +117,61 @@ interface PersistedState {
   targets: TargetInput[];
 }
 
+type AliyunFeature = "whitelist" | "dns" | "domain" | "ssl";
+
+interface DnsDomainInfo {
+  domainName: string;
+  domainId?: string;
+  punyCode?: string;
+  recordCount?: number;
+  aliDomain?: boolean;
+  instanceId?: string;
+  versionCode?: string;
+}
+
+interface DnsRecord {
+  recordId: string;
+  domainName: string;
+  rr: string;
+  recordType: string;
+  value: string;
+  ttl?: number;
+  status?: string;
+  locked?: boolean;
+  weight?: number;
+  line?: string;
+  remark?: string;
+}
+
+interface DnsRecordInput {
+  recordId?: string;
+  domainName: string;
+  rr: string;
+  recordType: string;
+  value: string;
+  ttl?: number;
+  priority?: number;
+  line?: string;
+}
+
+interface DomainInfo {
+  domainName: string;
+  instanceId?: string;
+  registrationDate?: string;
+  expirationDate?: string;
+  expirationDateStatus?: string;
+  domainStatus?: string;
+  premiumDns?: boolean;
+  remark?: string;
+}
+
+interface CasCertContent {
+  orderId: number;
+  cert?: string;
+  privateKey?: string;
+  message?: string;
+}
+
 interface SshShortcutRow {
   alias: string;
   hostName?: string | null;
@@ -163,6 +219,17 @@ const CONFIG_BACKUP_SCHEMA = "sp-toolbox-config";
 const ALIYUN_TARGET_TYPE_OPTIONS: { label: string; value: AliyunTargetType }[] = [
   { label: "ECS 安全组", value: "ecsSecurityGroup" },
   { label: "PolarDB 集群白名单", value: "polardbClusterWhitelist" },
+];
+
+const DNS_RECORD_TYPE_OPTIONS = [
+  "A", "CNAME", "MX", "TXT", "AAAA", "NS", "SRV", "CAA", "PTR", "显性URL", "隐性URL",
+];
+
+const ALIYUN_FEATURE_OPTIONS: { label: string; value: AliyunFeature }[] = [
+  { label: "白名单同步", value: "whitelist" },
+  { label: "域名解析", value: "dns" },
+  { label: "域名信息", value: "domain" },
+  { label: "SSL证书", value: "ssl" },
 ];
 
 function aliyunTargetTypeLabel(targetType: AliyunTargetType): string {
@@ -225,6 +292,54 @@ function formatDateText(date: Date): string {
 
 function isRecordObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function extractCasOrders(response: Record<string, unknown>): Record<string, unknown>[] {
+  const candidates: unknown[] = [
+    response.CertificateOrderIdList,
+    response.X509CertificateList,
+    response.Data,
+    response.List,
+    response,
+  ];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate as Record<string, unknown>[];
+    if (isRecordObject(candidate)) {
+      for (const key of [
+        "X509Certificate",
+        "CertificateOrderId",
+        "Certificate",
+        "orders",
+        "list",
+      ]) {
+        const nested = candidate[key];
+        if (Array.isArray(nested)) return nested as Record<string, unknown>[];
+      }
+    }
+  }
+  return [];
+}
+
+function daysUntil(dateStr: string | undefined): number | null {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return null;
+  return Math.ceil((d.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+}
+
+function casField(obj: Record<string, unknown>, ...keys: string[]): unknown {
+  for (const key of keys) {
+    if (key in obj) return obj[key];
+  }
+  const lowerMap: Record<string, string> = {};
+  for (const k of Object.keys(obj)) {
+    lowerMap[k.toLowerCase()] = k;
+  }
+  for (const key of keys) {
+    const matched = lowerMap[key.toLowerCase()];
+    if (matched) return obj[matched];
+  }
+  return undefined;
 }
 
 
@@ -425,6 +540,25 @@ export default function App() {
   const [aliyunSection, setAliyunSection] = useState<"run" | "accounts" | "targets">("run");
   const [showAccountEditor, setShowAccountEditor] = useState(false);
   const [showTargetEditor, setShowTargetEditor] = useState(false);
+
+  const [aliyunFeature, setAliyunFeature] = useState<AliyunFeature>("whitelist");
+  const [aliyunActiveAccountId, setAliyunActiveAccountId] = useState("");
+  const [dnsDomains, setDnsDomains] = useState<DnsDomainInfo[]>([]);
+  const [dnsSelectedDomain, setDnsSelectedDomain] = useState("");
+  const [dnsRecords, setDnsRecords] = useState<DnsRecord[]>([]);
+  const [dnsLoading, setDnsLoading] = useState(false);
+  const [dnsRecordModalOpen, setDnsRecordModalOpen] = useState(false);
+  const [dnsEditingRecord, setDnsEditingRecord] = useState<DnsRecordInput | null>(null);
+  const [dnsSavingRecord, setDnsSavingRecord] = useState(false);
+  const [domainList, setDomainList] = useState<DomainInfo[]>([]);
+  const [domainLoading, setDomainLoading] = useState(false);
+  const [casOrders, setCasOrders] = useState<Record<string, unknown>[]>([]);
+  const [casLoading, setCasLoading] = useState(false);
+  const [casCertModalOpen, setCasCertModalOpen] = useState(false);
+  const [casViewingOrderId, setCasViewingOrderId] = useState<number | null>(null);
+  const [casViewingCert, setCasViewingCert] = useState<CasCertContent | null>(null);
+  const [casLoadingCert, setCasLoadingCert] = useState(false);
+  const [casFreeCertDomain, setCasFreeCertDomain] = useState("");
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [configTransferAction, setConfigTransferAction] = useState<"import" | "export" | null>(null);
@@ -1191,6 +1325,241 @@ export default function App() {
     refMap[section].current?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
+  // ── 域名解析 (DNS) ──
+
+  const aliyunActiveAccount = useMemo(
+    () => accounts.find((a) => a.id === aliyunActiveAccountId) || null,
+    [accounts, aliyunActiveAccountId],
+  );
+
+  const dnsDomainOptions = useMemo(
+    () => dnsDomains.map((d) => ({ label: d.domainName, value: d.domainName })),
+    [dnsDomains],
+  );
+
+  const loadDnsDomains = async () => {
+    if (!aliyunActiveAccount) {
+      messageApi.warning("请先选择账号");
+      return;
+    }
+    setDnsLoading(true);
+    try {
+      const domains = await invoke<DnsDomainInfo[]>("dns_list_domains", {
+        account: aliyunActiveAccount,
+      });
+      setDnsDomains(domains);
+      if (domains.length > 0 && !dnsSelectedDomain) {
+        setDnsSelectedDomain(domains[0].domainName);
+      }
+    } catch (err) {
+      messageApi.error(`加载域名列表失败: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setDnsLoading(false);
+    }
+  };
+
+  const loadDnsRecords = async (domainName?: string) => {
+    const targetDomain = domainName ?? dnsSelectedDomain;
+    if (!targetDomain || !aliyunActiveAccount) return;
+    setDnsLoading(true);
+    try {
+      const records = await invoke<DnsRecord[]>("dns_list_records", {
+        account: aliyunActiveAccount,
+        domainName: targetDomain,
+      });
+      setDnsRecords(records);
+    } catch (err) {
+      messageApi.error(`加载解析记录失败: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setDnsLoading(false);
+    }
+  };
+
+  const openDnsRecordEditor = (record?: DnsRecord) => {
+    if (!dnsSelectedDomain) {
+      messageApi.warning("请先选择域名");
+      return;
+    }
+    setDnsEditingRecord(
+      record
+        ? {
+            recordId: record.recordId,
+            domainName: record.domainName,
+            rr: record.rr,
+            recordType: record.recordType,
+            value: record.value,
+            ttl: record.ttl,
+            line: record.line,
+          }
+        : {
+            domainName: dnsSelectedDomain,
+            rr: "",
+            recordType: "A",
+            value: "",
+            ttl: 600,
+          },
+    );
+    setDnsRecordModalOpen(true);
+  };
+
+  const saveDnsRecord = async () => {
+    if (!dnsEditingRecord || !aliyunActiveAccount) return;
+    if (!dnsEditingRecord.rr.trim() || !dnsEditingRecord.value.trim()) {
+      messageApi.warning("主机记录和记录值不能为空");
+      return;
+    }
+    setDnsSavingRecord(true);
+    try {
+      const result = await invoke<string>("dns_save_record", {
+        account: aliyunActiveAccount,
+        input: dnsEditingRecord,
+      });
+      messageApi.success(result);
+      setDnsRecordModalOpen(false);
+      setDnsEditingRecord(null);
+      await loadDnsRecords();
+    } catch (err) {
+      messageApi.error(`保存失败: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setDnsSavingRecord(false);
+    }
+  };
+
+  const deleteDnsRecord = async (recordId: string) => {
+    if (!aliyunActiveAccount) return;
+    try {
+      const result = await invoke<string>("dns_delete_record", {
+        account: aliyunActiveAccount,
+        recordId,
+      });
+      messageApi.success(result);
+      await loadDnsRecords();
+    } catch (err) {
+      messageApi.error(`删除失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const toggleDnsRecordStatus = async (recordId: string, currentStatus: string) => {
+    if (!aliyunActiveAccount) return;
+    const next = currentStatus === "Enable" ? "Disable" : "Enable";
+    try {
+      const result = await invoke<string>("dns_set_record_status", {
+        account: aliyunActiveAccount,
+        recordId,
+        status: next,
+      });
+      messageApi.success(result);
+      await loadDnsRecords();
+    } catch (err) {
+      messageApi.error(`切换状态失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  // ── 域名信息 ──
+
+  const loadDomainList = async () => {
+    if (!aliyunActiveAccount) {
+      messageApi.warning("请先选择账号");
+      return;
+    }
+    setDomainLoading(true);
+    try {
+      const domains = await invoke<DomainInfo[]>("domain_list", {
+        account: aliyunActiveAccount,
+      });
+      setDomainList(domains);
+    } catch (err) {
+      messageApi.error(`加载域名信息失败: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setDomainLoading(false);
+    }
+  };
+
+  // ── SSL 证书 ──
+
+  const loadCasOrders = async () => {
+    if (!aliyunActiveAccount) {
+      messageApi.warning("请先选择账号");
+      return;
+    }
+    setCasLoading(true);
+    try {
+      const response = await invoke<Record<string, unknown>>("cas_list_orders", {
+        account: aliyunActiveAccount,
+      });
+      const orders = extractCasOrders(response);
+      setCasOrders(orders);
+    } catch (err) {
+      messageApi.error(`加载证书列表失败: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setCasLoading(false);
+    }
+  };
+
+  const viewCasCert = async (orderId: number) => {
+    if (!aliyunActiveAccount) return;
+    setCasLoadingCert(true);
+    setCasViewingOrderId(orderId);
+    try {
+      const cert = await invoke<CasCertContent>("cas_get_cert", {
+        account: aliyunActiveAccount,
+        orderId,
+      });
+      setCasViewingCert(cert);
+      setCasCertModalOpen(true);
+    } catch (err) {
+      messageApi.error(`获取证书失败: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setCasLoadingCert(false);
+    }
+  };
+
+  const createCasFreeCert = async () => {
+    if (!aliyunActiveAccount || !casFreeCertDomain.trim()) {
+      messageApi.warning("请输入域名");
+      return;
+    }
+    try {
+      await invoke("cas_create_free_cert", {
+        account: aliyunActiveAccount,
+        domainName: casFreeCertDomain.trim(),
+      });
+      messageApi.success("免费证书申请已提交，请到控制台完成域名验证");
+      setCasFreeCertDomain("");
+      await loadCasOrders();
+    } catch (err) {
+      messageApi.error(`申请失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  // ── 功能区切换时自动加载 ──
+
+  useEffect(() => {
+    if (accounts.length > 0 && !aliyunActiveAccountId) {
+      setAliyunActiveAccountId(accounts[0].id);
+    }
+  }, [accounts, aliyunActiveAccountId]);
+
+  useEffect(() => {
+    if (aliyunFeature === "dns" && aliyunActiveAccount && dnsDomains.length === 0) {
+      void loadDnsDomains();
+    }
+    if (aliyunFeature === "domain" && aliyunActiveAccount && domainList.length === 0) {
+      void loadDomainList();
+    }
+    if (aliyunFeature === "ssl" && aliyunActiveAccount && casOrders.length === 0) {
+      void loadCasOrders();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aliyunFeature, aliyunActiveAccountId]);
+
+  useEffect(() => {
+    if (aliyunFeature === "dns" && dnsSelectedDomain) {
+      void loadDnsRecords(dnsSelectedDomain);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dnsSelectedDomain]);
+
   const accountColumns: ColumnsType<AccountInput> = [
     {
       title: "名称",
@@ -1597,8 +1966,261 @@ export default function App() {
 
 
 
+  const dnsRecordColumns: ColumnsType<DnsRecord> = [
+    { title: "主机记录", dataIndex: "rr", key: "rr", width: 120,
+      render: (rr: string) => <Typography.Text code>{rr}</Typography.Text> },
+    { title: "类型", dataIndex: "recordType", key: "recordType", width: 80,
+      render: (t: string) => <Tag>{t}</Tag> },
+    { title: "记录值", dataIndex: "value", key: "value", ellipsis: true },
+    { title: "TTL", dataIndex: "ttl", key: "ttl", width: 60 },
+    { title: "状态", dataIndex: "status", key: "status", width: 70,
+      render: (s?: string) => s === "Enable" ? <Tag color="green">启用</Tag> : <Tag color="orange">暂停</Tag> },
+    { title: "操作", key: "actions", width: 210,
+      render: (_: unknown, r: DnsRecord) => (
+        <Space size="small">
+          <Button size="small" type="link" onClick={() => openDnsRecordEditor(r)}>编辑</Button>
+          <Button size="small" type="link" onClick={() => toggleDnsRecordStatus(r.recordId, r.status || "Enable")}>
+            {r.status === "Enable" ? "暂停" : "启用"}
+          </Button>
+          <Popconfirm title="确认删除该解析记录？" onConfirm={() => deleteDnsRecord(r.recordId)}>
+            <Button size="small" type="link" danger>删除</Button>
+          </Popconfirm>
+        </Space>
+      )},
+  ];
+
+  const dnsPage = (
+    <Card className="section-card" bordered={false}>
+      <div className="section-title-row">
+        <Typography.Title level={4} className="section-block-title">域名解析</Typography.Title>
+        <Space>
+          <Select size="small" style={{ minWidth: 200 }} placeholder="选择域名"
+            value={dnsSelectedDomain || undefined}
+            onChange={(val) => { setDnsSelectedDomain(val); void loadDnsRecords(val); }}
+            options={dnsDomainOptions}
+            notFoundContent="暂无域名"
+          />
+          <Button size="small" icon={<ReloadOutlined />} loading={dnsLoading} onClick={() => void loadDnsDomains()}>刷新域名</Button>
+          <Button size="small" type="primary" icon={<PlusOutlined />} disabled={!dnsSelectedDomain} onClick={() => openDnsRecordEditor()}>添加记录</Button>
+        </Space>
+      </div>
+      <Typography.Paragraph type="secondary">域名 <Typography.Text code>{dnsSelectedDomain || "-"}</Typography.Text> 的 DNS 解析记录，共 {dnsRecords.length} 条</Typography.Paragraph>
+      <Table<DnsRecord>
+        className="modern-table"
+        rowKey="recordId"
+        columns={dnsRecordColumns}
+        dataSource={dnsRecords}
+        size="small"
+        loading={dnsLoading}
+        pagination={{ pageSize: 15, showSizeChanger: false }}
+        locale={{ emptyText: "暂无解析记录" }}
+        tableLayout="fixed"
+      />
+      <Modal
+        title={dnsEditingRecord?.recordId ? "编辑解析记录" : "添加解析记录"}
+        open={dnsRecordModalOpen}
+        onOk={() => void saveDnsRecord()}
+        onCancel={() => { setDnsRecordModalOpen(false); setDnsEditingRecord(null); }}
+        confirmLoading={dnsSavingRecord}
+        okText="保存"
+        cancelText="取消"
+        destroyOnClose
+      >
+        {dnsEditingRecord && (
+          <div className="dns-editor-stack">
+            <div>
+              <Typography.Text strong>域名：{dnsEditingRecord.domainName}</Typography.Text>
+            </div>
+            <Input addonBefore="主机记录" value={dnsEditingRecord.rr}
+              onChange={(e) => setDnsEditingRecord({ ...dnsEditingRecord, rr: e.target.value })}
+              placeholder="@ 或 www 等" />
+            <div className="modal-field-row">
+              <Typography.Text strong className="modal-field-label">记录类型</Typography.Text>
+              <Select value={dnsEditingRecord.recordType}
+                onChange={(val) => setDnsEditingRecord({ ...dnsEditingRecord, recordType: val })}
+                options={DNS_RECORD_TYPE_OPTIONS.map((t) => ({ label: t, value: t }))}
+                style={{ width: "100%" }} />
+            </div>
+            <Input addonBefore="记录值" value={dnsEditingRecord.value}
+              onChange={(e) => setDnsEditingRecord({ ...dnsEditingRecord, value: e.target.value })}
+              placeholder="例如 1.2.3.4 或 target.example.com" />
+            <Input addonBefore="TTL（秒）" type="number" value={dnsEditingRecord.ttl ?? 600}
+              onChange={(e) => setDnsEditingRecord({ ...dnsEditingRecord, ttl: parseInt(e.target.value) || 600 })}
+              placeholder="600" />
+          </div>
+        )}
+      </Modal>
+    </Card>
+  );
+
+  const domainColumns: ColumnsType<DomainInfo> = [
+    { title: "域名", dataIndex: "domainName", key: "domainName", width: 200,
+      render: (name: string) => <Typography.Link href={`https://${name}`} target="_blank">{name}</Typography.Link> },
+    { title: "注册日期", dataIndex: "registrationDate", key: "registrationDate", width: 140 },
+    { title: "到期日期", dataIndex: "expirationDate", key: "expirationDate", width: 140,
+      render: (date: string | undefined) => {
+        const d = daysUntil(date);
+        if (d === null) return date || "-";
+        const expired = d < 0;
+        const urgent = d >= 0 && d <= 30;
+        return (
+          <span>
+            {date}
+            {expired && <Tag color="red" style={{ marginLeft: 8 }}>已过期 {-d} 天</Tag>}
+            {urgent && <Tag color="orange" style={{ marginLeft: 8 }}>即将到期 {d} 天</Tag>}
+            {!expired && !urgent && <Tag color="green" style={{ marginLeft: 8 }}>正常</Tag>}
+          </span>
+        );
+      }},
+    { title: "状态", dataIndex: "domainStatus", key: "domainStatus", width: 100,
+      render: (s?: string) => s === "1" ? <Tag color="green">正常</Tag> : <Tag color="default">{s || "-"}</Tag> },
+  ];
+
+  const domainPage = (
+    <Card className="section-card" bordered={false}>
+      <div className="section-title-row">
+        <Typography.Title level={4} className="section-block-title">域名信息</Typography.Title>
+        <Button size="small" icon={<ReloadOutlined />} loading={domainLoading} onClick={() => void loadDomainList()}>刷新</Button>
+      </div>
+      <Typography.Paragraph type="secondary">该账号下已注册的域名及到期时间，共 {domainList.length} 个域名</Typography.Paragraph>
+      <Table<DomainInfo>
+        className="modern-table"
+        rowKey="domainName"
+        columns={domainColumns}
+        dataSource={domainList}
+        size="small"
+        loading={domainLoading}
+        pagination={{ pageSize: 15, showSizeChanger: false }}
+        locale={{ emptyText: "暂无域名" }}
+        tableLayout="fixed"
+      />
+    </Card>
+  );
+
+  const casStatusInfo = (status: unknown): { label: string; color: string } => {
+    const s = String(status ?? "");
+    switch (s) {
+      case "1": case "issue": return { label: "已签发", color: "green" };
+      case "2": case "pending": return { label: "待验证", color: "orange" };
+      case "0": case "unissued": return { label: "未签发", color: "default" };
+      default: return { label: s, color: "default" };
+    }
+  };
+
+  const sslPage = (
+    <Card className="section-card" bordered={false}>
+      <div className="section-title-row">
+        <Typography.Title level={4} className="section-block-title">SSL 证书</Typography.Title>
+        <Button size="small" icon={<ReloadOutlined />} loading={casLoading} onClick={() => void loadCasOrders()}>刷新</Button>
+      </div>
+      <Card size="small" className="section-inner-card" bordered={false}>
+        <Typography.Title level={5}>申请免费 DV 证书</Typography.Title>
+        <Space>
+          <Input value={casFreeCertDomain} onChange={(e) => setCasFreeCertDomain(e.target.value)}
+            placeholder="请输入域名" style={{ width: 300 }} addonBefore="域名" />
+          <Button type="primary" onClick={() => void createCasFreeCert()}>申请</Button>
+        </Space>
+        <Typography.Paragraph type="secondary" style={{ marginTop: 8 }}>
+          申请后需在 DNS 中添加 TXT 验证记录，完成后在 Aliyun 控制台点击验证完成签发
+        </Typography.Paragraph>
+      </Card>
+      <div className="section-splitter" />
+      <Table
+        className="modern-table"
+        rowKey={(r: Record<string, unknown>) => String(casField(r, "certificateOrderId", "CertificateOrderId", "orderId"))}
+        columns={[
+          { title: "订单 ID", key: "orderId", width: 100,
+            render: (_: unknown, r: Record<string, unknown>) => String(casField(r, "certificateOrderId", "CertificateOrderId") ?? "-") },
+          { title: "域名", key: "domain", width: 200,
+            render: (_: unknown, r: Record<string, unknown>) => String(casField(r, "domain", "Domain", "commonName") ?? "-") },
+          { title: "类型", key: "type", width: 80,
+            render: (_: unknown, r: Record<string, unknown>) => String(casField(r, "certType", "CertType", "productName", "ProductName") ?? "-") },
+          { title: "签发时间", key: "start", width: 150,
+            render: (_: unknown, r: Record<string, unknown>) => String(casField(r, "certStartTime", "CertStartTime") ?? "-") },
+          { title: "到期时间", key: "end", width: 150,
+            render: (_: unknown, r: Record<string, unknown>) => {
+              const end = String(casField(r, "certEndTime", "CertEndTime") ?? "-");
+              const d = daysUntil(end);
+              return (
+                <span>
+                  {end}
+                  {d !== null && d < 0 && <Tag color="red" style={{ marginLeft: 4 }}>已过期</Tag>}
+                  {d !== null && d >= 0 && d <= 30 && <Tag color="orange" style={{ marginLeft: 4 }}>{d} 天后到期</Tag>}
+                </span>
+              );
+            }},
+          { title: "状态", key: "status", width: 80,
+            render: (_: unknown, r: Record<string, unknown>) => {
+              const s = casStatusInfo(casField(r, "status", "Status"));
+              return <Tag color={s.color}>{s.label}</Tag>;
+            }},
+          { title: "操作", key: "actions", width: 100,
+            render: (_: unknown, r: Record<string, unknown>) => {
+              const orderId = casField(r, "certificateOrderId", "CertificateOrderId");
+              return (
+                <Button size="small" type="link" loading={casLoadingCert && casViewingOrderId === Number(orderId)}
+                  onClick={() => orderId && viewCasCert(Number(orderId))}
+                  disabled={!orderId}>
+                  查看证书
+                </Button>
+              );
+            }},
+        ]}
+        dataSource={casOrders}
+        size="small"
+        loading={casLoading}
+        pagination={{ pageSize: 10, showSizeChanger: false }}
+        locale={{ emptyText: "暂无证书订单" }}
+        tableLayout="fixed"
+      />
+      <Modal
+        title="证书内容"
+        open={casCertModalOpen}
+        onCancel={() => { setCasCertModalOpen(false); setCasViewingCert(null); }}
+        footer={null}
+        width={700}
+        destroyOnClose
+      >
+        {casViewingCert && (
+          <div>
+            <Typography.Paragraph><Typography.Text strong>证书内容：</Typography.Text></Typography.Paragraph>
+            <Input.TextArea value={casViewingCert.cert || ""} readOnly rows={6} style={{ fontFamily: "monospace", fontSize: 12 }} />
+            <div className="section-splitter" />
+            <Typography.Paragraph><Typography.Text strong>私钥：</Typography.Text></Typography.Paragraph>
+            <Input.TextArea value={casViewingCert.privateKey || ""} readOnly rows={6} style={{ fontFamily: "monospace", fontSize: 12 }} />
+            {casViewingCert.message && (
+              <Typography.Paragraph type="secondary" style={{ marginTop: 8 }}>
+                {casViewingCert.message}
+              </Typography.Paragraph>
+            )}
+          </div>
+        )}
+      </Modal>
+    </Card>
+  );
+
   const aliyunPage = (
     <div className="workspace-stack">
+      <div className="aliyun-feature-bar">
+        <Segmented
+          size="small"
+          value={aliyunFeature}
+          onChange={(val) => setAliyunFeature(val as AliyunFeature)}
+          options={ALIYUN_FEATURE_OPTIONS}
+        />
+        {aliyunFeature !== "whitelist" && (
+          <Select
+            size="small"
+            style={{ minWidth: 160 }}
+            placeholder="选择账号"
+            value={aliyunActiveAccountId || undefined}
+            onChange={(val) => setAliyunActiveAccountId(val)}
+            options={accountOptions}
+          />
+        )}
+      </div>
+      {aliyunFeature === "whitelist" && (
+      <>
       <Card className="topbar-card" bordered={false}>
         <div className="topbar-inner">
           <div className="topbar-left">
@@ -1897,6 +2519,11 @@ export default function App() {
           ) : null}
         </Card>
       </div>
+      </>
+      )}
+      {aliyunFeature === "dns" && dnsPage}
+      {aliyunFeature === "domain" && domainPage}
+      {aliyunFeature === "ssl" && sslPage}
     </div>
   );
 

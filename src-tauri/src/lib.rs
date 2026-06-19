@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HOST};
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -23,6 +22,12 @@ const POLARDB_VERSION: &str = "2017-08-01";
 const STS_VERSION: &str = "2015-04-01";
 const STS_HOST: &str = "sts.aliyuncs.com";
 const POLARDB_HOST: &str = "polardb.aliyuncs.com";
+const DNS_HOST: &str = "alidns.aliyuncs.com";
+const DNS_VERSION: &str = "2015-01-09";
+const DOMAIN_HOST: &str = "domain.aliyuncs.com";
+const DOMAIN_VERSION: &str = "2018-01-29";
+const CAS_HOST: &str = "cas.aliyuncs.com";
+const CAS_VERSION: &str = "2020-04-07";
 const LOCAL_BACKEND_DIR: &str = "/Users/spenceryg/Documents/taisheng/junziyun-v7";
 const LOCAL_FRONTEND_DIR: &str = "/Users/spenceryg/Documents/taisheng/taisheng_web";
 const LOCAL_BACKEND_PORT: u16 = 9528;
@@ -203,6 +208,78 @@ struct AppWorldsIpResponse {
     code: Option<i64>,
     data: Option<AppWorldsIpData>,
     msg: Option<String>,
+}
+
+// ── DNS 解析记录 ──
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DnsDomainInfo {
+    domain_name: String,
+    domain_id: Option<String>,
+    puny_code: Option<String>,
+    record_count: Option<i64>,
+    ali_domain: Option<bool>,
+    instance_id: Option<String>,
+    version_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DnsRecord {
+    record_id: String,
+    domain_name: String,
+    rr: String,
+    record_type: String,
+    value: String,
+    ttl: Option<i64>,
+    status: Option<String>,
+    locked: Option<bool>,
+    weight: Option<i64>,
+    line: Option<String>,
+    remark: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DnsRecordInput {
+    record_id: Option<String>,
+    domain_name: String,
+    rr: String,
+    record_type: String,
+    value: String,
+    ttl: Option<i64>,
+    priority: Option<i64>,
+    line: Option<String>,
+}
+
+// ── 域名信息 ──
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DomainInfo {
+    domain_name: String,
+    instance_id: Option<String>,
+    registration_date: Option<String>,
+    expiration_date: Option<String>,
+    expiration_date_status: Option<String>,
+    domain_status: Option<String>,
+    premium_dns: Option<bool>,
+    resource_group_id: Option<String>,
+    email_status: Option<bool>,
+    transfer_out_status: Option<String>,
+    remark: Option<String>,
+}
+
+// ── SSL 证书 ──
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CasCertContent {
+    order_id: i64,
+    cert: Option<String>,
+    private_key: Option<String>,
+    message: Option<String>,
 }
 
 #[derive(Debug)]
@@ -531,6 +608,301 @@ async fn sync_all(request: SyncRequest) -> Result<SyncResponse, String> {
         cidr,
         results,
     })
+}
+
+// ═══════════════════════════════════════════════════
+// DNS 解析记录管理
+// ═══════════════════════════════════════════════════
+
+#[tauri::command]
+async fn dns_list_domains(account: AccountInput) -> Result<Vec<DnsDomainInfo>, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let params = BTreeMap::new();
+    let response = client
+        .call_rpc_json(DNS_HOST, "DescribeDomains", DNS_VERSION, &account, &params)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let domains = response
+        .pointer("/Domains/Domain")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(domains
+        .into_iter()
+        .filter_map(|d| {
+            let domain_name = d.get("DomainName").and_then(Value::as_str)?.to_string();
+            Some(DnsDomainInfo {
+                domain_name,
+                domain_id: json_to_string(d.get("DomainId")),
+                puny_code: json_to_opt_string(d.get("PunyCode")),
+                record_count: d.get("RecordCount").and_then(Value::as_i64),
+                ali_domain: d.get("AliDomain").and_then(Value::as_bool),
+                instance_id: json_to_opt_string(d.get("InstanceId")),
+                version_code: json_to_opt_string(d.get("VersionCode")),
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn dns_list_records(
+    account: AccountInput,
+    domain_name: String,
+) -> Result<Vec<DnsRecord>, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let mut params = BTreeMap::new();
+    params.insert("DomainName".to_string(), domain_name);
+    params.insert("PageSize".to_string(), "500".to_string());
+    params.insert("PageNumber".to_string(), "1".to_string());
+
+    let response = client
+        .call_rpc_json(DNS_HOST, "DescribeDomainRecords", DNS_VERSION, &account, &params)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let records = response
+        .pointer("/DomainRecords/Record")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(records
+        .into_iter()
+        .filter_map(|r| {
+            let record_id = json_to_string(r.get("RecordId"))?;
+            Some(DnsRecord {
+                record_id,
+                domain_name: json_to_opt_string(r.get("DomainName"))
+                    .unwrap_or_default(),
+                rr: json_to_opt_string(r.get("RR")).unwrap_or_default(),
+                record_type: json_to_opt_string(r.get("Type")).unwrap_or_default(),
+                value: json_to_opt_string(r.get("Value")).unwrap_or_default(),
+                ttl: r.get("TTL").and_then(Value::as_i64),
+                status: json_to_opt_string(r.get("Status")),
+                locked: r.get("Locked").and_then(Value::as_bool),
+                weight: r.get("Weight").and_then(Value::as_i64),
+                line: json_to_opt_string(r.get("Line")),
+                remark: json_to_opt_string(r.get("Remark")),
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn dns_save_record(
+    account: AccountInput,
+    input: DnsRecordInput,
+) -> Result<String, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let mut params = BTreeMap::new();
+    params.insert("DomainName".to_string(), input.domain_name);
+    params.insert("RR".to_string(), input.rr);
+    params.insert("Type".to_string(), input.record_type);
+    params.insert("Value".to_string(), input.value);
+
+    if let Some(ttl) = input.ttl {
+        params.insert("TTL".to_string(), ttl.to_string());
+    }
+    if let Some(priority) = input.priority {
+        params.insert("Priority".to_string(), priority.to_string());
+    }
+    if let Some(line) = &input.line {
+        if !line.is_empty() {
+            params.insert("Line".to_string(), line.clone());
+        }
+    }
+
+    let (action, label) = if let Some(record_id) = &input.record_id {
+        params.insert("RecordId".to_string(), record_id.clone());
+        ("UpdateDomainRecord", "更新")
+    } else {
+        ("AddDomainRecord", "添加")
+    };
+
+    let response = client
+        .call_rpc_json(DNS_HOST, action, DNS_VERSION, &account, &params)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(json_to_opt_string(response.get("RecordId"))
+        .or_else(|| json_to_opt_string(response.get("RequestId")))
+        .unwrap_or_else(|| format!("{label}成功")))
+}
+
+#[tauri::command]
+async fn dns_delete_record(account: AccountInput, record_id: String) -> Result<String, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let mut params = BTreeMap::new();
+    params.insert("RecordId".to_string(), record_id);
+
+    let response = client
+        .call_rpc_json(DNS_HOST, "DeleteDomainRecord", DNS_VERSION, &account, &params)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(json_to_opt_string(response.get("RequestId")).unwrap_or_else(|| "删除成功".to_string()))
+}
+
+#[tauri::command]
+async fn dns_set_record_status(
+    account: AccountInput,
+    record_id: String,
+    status: String,
+) -> Result<String, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let mut params = BTreeMap::new();
+    params.insert("RecordId".to_string(), record_id);
+    params.insert("Status".to_string(), status);
+
+    let response = client
+        .call_rpc_json(DNS_HOST, "SetDomainRecordStatus", DNS_VERSION, &account, &params)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(json_to_opt_string(response.get("RequestId")).unwrap_or_else(|| "状态切换成功".to_string()))
+}
+
+#[tauri::command]
+async fn dns_update_record_remark(
+    account: AccountInput,
+    record_id: String,
+    remark: String,
+) -> Result<String, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let mut params = BTreeMap::new();
+    params.insert("RecordId".to_string(), record_id);
+    params.insert("Remark".to_string(), remark);
+
+    let response = client
+        .call_rpc_json(DNS_HOST, "UpdateDomainRecordRemark", DNS_VERSION, &account, &params)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(json_to_opt_string(response.get("RequestId")).unwrap_or_else(|| "备注更新成功".to_string()))
+}
+
+// ═══════════════════════════════════════════════════
+// 域名信息管理
+// ═══════════════════════════════════════════════════
+
+#[tauri::command]
+async fn domain_list(account: AccountInput) -> Result<Vec<DomainInfo>, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let mut params = BTreeMap::new();
+    params.insert("PageNum".to_string(), "1".to_string());
+    params.insert("PageSize".to_string(), "100".to_string());
+
+    let response = client
+        .call_rpc_json(DOMAIN_HOST, "QueryDomainList", DOMAIN_VERSION, &account, &params)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let domains = response
+        .pointer("/Data/Domain")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(domains
+        .into_iter()
+        .filter_map(|d| {
+            let domain_name = d.get("DomainName").and_then(Value::as_str)?.to_string();
+            Some(DomainInfo {
+                domain_name,
+                instance_id: json_to_opt_string(d.get("InstanceId")),
+                registration_date: json_to_opt_string(d.get("RegistrationDate")),
+                expiration_date: json_to_opt_string(d.get("ExpirationDate")),
+                expiration_date_status: json_to_opt_string(d.get("ExpirationDateStatus")),
+                domain_status: json_to_opt_string(d.get("DomainStatus")),
+                premium_dns: d.get("PremiumDNS").and_then(Value::as_bool),
+                resource_group_id: json_to_opt_string(d.get("ResourceGroupId")),
+                email_status: d.get("Emailstatus").and_then(Value::as_bool),
+                transfer_out_status: json_to_opt_string(d.get("TransferOutStatus")),
+                remark: json_to_opt_string(d.get("Remark")),
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn domain_detail(account: AccountInput, domain_name: String) -> Result<Value, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let mut params = BTreeMap::new();
+    params.insert("DomainName".to_string(), domain_name);
+
+    let response = client
+        .call_rpc_json(
+            DOMAIN_HOST,
+            "QueryDomainByDomainName",
+            DOMAIN_VERSION,
+            &account,
+            &params,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(response)
+}
+
+// ═══════════════════════════════════════════════════
+// SSL 证书管理
+// ═══════════════════════════════════════════════════
+
+#[tauri::command]
+async fn cas_list_orders(account: AccountInput) -> Result<Value, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let mut params = BTreeMap::new();
+    params.insert("CurrentPage".to_string(), "1".to_string());
+    params.insert("ShowSize".to_string(), "50".to_string());
+
+    let response = client
+        .call_rpc_json(CAS_HOST, "ListUserCertificateOrder", CAS_VERSION, &account, &params)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(response)
+}
+
+#[tauri::command]
+async fn cas_get_cert(account: AccountInput, order_id: i64) -> Result<CasCertContent, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let mut params = BTreeMap::new();
+    params.insert("OrderId".to_string(), order_id.to_string());
+
+    let response = client
+        .call_rpc_json(CAS_HOST, "GetUserCertificateDetail", CAS_VERSION, &account, &params)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(CasCertContent {
+        order_id,
+        cert: json_to_opt_string(response.get("Certificate")),
+        private_key: json_to_opt_string(response.get("PrivateKey")),
+        message: json_to_opt_string(response.get("Message")),
+    })
+}
+
+#[tauri::command]
+async fn cas_create_free_cert(account: AccountInput, domain_name: String) -> Result<Value, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let mut params = BTreeMap::new();
+    params.insert("ProductCode".to_string(), "free".to_string());
+    params.insert("Domain".to_string(), domain_name);
+
+    let response = client
+        .call_rpc_json(
+            CAS_HOST,
+            "CreateCertificateForConnect",
+            CAS_VERSION,
+            &account,
+            &params,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(response)
 }
 
 #[tauri::command]
@@ -2341,6 +2713,25 @@ fn ecs_host(region_id: &str) -> String {
     format!("ecs.{region_id}.aliyuncs.com")
 }
 
+fn json_to_string(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn json_to_opt_string(value: Option<&Value>) -> Option<String> {
+    let s = json_to_string(value)?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn form_url_encode(params: &BTreeMap<String, String>) -> String {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     for (key, value) in params {
@@ -2382,6 +2773,17 @@ pub fn run() {
             detect_public_ip,
             verify_account,
             sync_all,
+            dns_list_domains,
+            dns_list_records,
+            dns_save_record,
+            dns_delete_record,
+            dns_set_record_status,
+            dns_update_record_remark,
+            domain_list,
+            domain_detail,
+            cas_list_orders,
+            cas_get_cert,
+            cas_create_free_cert,
             list_ssh_shortcuts,
             open_ssh_terminal,
             start_local_dev_services,
