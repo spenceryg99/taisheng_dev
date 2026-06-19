@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -500,6 +500,9 @@ function readThemeMode(): ThemeMode {
   }
 }
 
+const _initialTheme = readThemeMode();
+document.body.classList.add(`theme-${_initialTheme}`);
+
 export default function App() {
   const [messageApi, messageContext] = message.useMessage();
   const [moduleKey, setModuleKey] = useState<ModuleKey>("aliyun");
@@ -677,6 +680,14 @@ export default function App() {
     }),
     [isDarkMode]
   );
+
+  useLayoutEffect(() => {
+    document.body.className = document.body.className
+      .replace(/theme-\w+/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    document.body.classList.add(`theme-${themeMode}`);
+  }, [themeMode]);
 
   const toggleThemeMode = (): void => {
     setThemeMode((prev) => {
