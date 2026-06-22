@@ -117,7 +117,7 @@ interface PersistedState {
   targets: TargetInput[];
 }
 
-type AliyunFeature = "whitelist" | "dns" | "domain" | "ssl";
+type AliyunFeature = "whitelist" | "dns" | "domain" | "ssl" | "ecs";
 
 interface DnsDomainInfo {
   domainName: string;
@@ -170,6 +170,21 @@ interface CasCertContent {
   cert?: string;
   privateKey?: string;
   message?: string;
+}
+
+interface EcsInstance {
+  instanceId: string;
+  instanceName?: string;
+  status?: string;
+  regionId: string;
+  zoneId?: string;
+  instanceType?: string;
+  creationTime?: string;
+  expiredTime?: string;
+  privateIpAddress?: string;
+  publicIpAddress?: string;
+  vpcId?: string;
+  tags?: string;
 }
 
 interface SshShortcutRow {
@@ -230,6 +245,7 @@ const ALIYUN_FEATURE_OPTIONS: { label: string; value: AliyunFeature }[] = [
   { label: "域名解析", value: "dns" },
   { label: "域名信息", value: "domain" },
   { label: "SSL证书", value: "ssl" },
+  { label: "ECS实例", value: "ecs" },
 ];
 
 function aliyunTargetTypeLabel(targetType: AliyunTargetType): string {
@@ -562,6 +578,8 @@ export default function App() {
   const [casViewingCert, setCasViewingCert] = useState<CasCertContent | null>(null);
   const [casLoadingCert, setCasLoadingCert] = useState(false);
   const [casFreeCertDomain, setCasFreeCertDomain] = useState("");
+  const [ecsInstances, setEcsInstances] = useState<EcsInstance[]>([]);
+  const [ecsLoading, setEcsLoading] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [configTransferAction, setConfigTransferAction] = useState<"import" | "export" | null>(null);
@@ -1543,6 +1561,26 @@ export default function App() {
     }
   };
 
+  // ── ECS 实例 ──
+
+  const loadEcsInstances = async () => {
+    if (!aliyunActiveAccount) {
+      messageApi.warning("请先选择账号");
+      return;
+    }
+    setEcsLoading(true);
+    try {
+      const instances = await invoke<EcsInstance[]>("ecs_list_instances", {
+        account: aliyunActiveAccount,
+      });
+      setEcsInstances(instances);
+    } catch (err) {
+      messageApi.error(`加载 ECS 实例失败: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setEcsLoading(false);
+    }
+  };
+
   // ── 功能区切换时自动加载 ──
 
   useEffect(() => {
@@ -1560,6 +1598,9 @@ export default function App() {
     }
     if (aliyunFeature === "ssl" && aliyunActiveAccount && casOrders.length === 0) {
       void loadCasOrders();
+    }
+    if (aliyunFeature === "ecs" && aliyunActiveAccount && ecsInstances.length === 0) {
+      void loadEcsInstances();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aliyunFeature, aliyunActiveAccountId]);
@@ -2210,6 +2251,70 @@ export default function App() {
     </Card>
   );
 
+  const ecsStatusColor = (status: string | undefined): string => {
+    switch (status) {
+      case "Running": return "green";
+      case "Stopped": return "error";
+      case "Starting": case "Stopping": return "orange";
+      default: return "default";
+    }
+  };
+
+  const ecsStatusLabel = (status: string | undefined): string => {
+    switch (status) {
+      case "Running": return "运行中";
+      case "Stopped": return "已停止";
+      case "Starting": return "启动中";
+      case "Stopping": return "停止中";
+      default: return status || "未知";
+    }
+  };
+
+  const ecsColumns: ColumnsType<EcsInstance> = [
+    { title: "实例 ID", dataIndex: "instanceId", key: "instanceId", width: 150,
+      render: (id: string) => <Typography.Text code>{id}</Typography.Text> },
+    { title: "名称", dataIndex: "instanceName", key: "instanceName", width: 140,
+      render: (name?: string) => name || "-" },
+    { title: "状态", dataIndex: "status", key: "status", width: 80,
+      render: (s?: string) => <Tag color={ecsStatusColor(s)}>{ecsStatusLabel(s)}</Tag> },
+    { title: "地域", dataIndex: "regionId", key: "regionId", width: 120 },
+    { title: "可用区", dataIndex: "zoneId", key: "zoneId", width: 100,
+      render: (z?: string) => z || "-" },
+    { title: "规格", dataIndex: "instanceType", key: "instanceType", width: 120,
+      render: (t?: string) => t || "-" },
+    { title: "到期时间", dataIndex: "expiredTime", key: "expiredTime", width: 150,
+      render: (t?: string) => t || "-" },
+    { title: "私网 IP", dataIndex: "privateIpAddress", key: "privateIpAddress", width: 140,
+      render: (ip?: string) => ip || "-" },
+    { title: "公网 IP", dataIndex: "publicIpAddress", key: "publicIpAddress", width: 140,
+      render: (ip?: string) => ip || "-" },
+    { title: "VPC", dataIndex: "vpcId", key: "vpcId", width: 140,
+      render: (vpc?: string) => vpc ? <Typography.Text code>{vpc.slice(0, 8)}...</Typography.Text> : "-" },
+    { title: "创建时间", dataIndex: "creationTime", key: "creationTime", width: 150,
+      render: (t?: string) => t || "-" },
+  ];
+
+  const ecsPage = (
+    <Card className="section-card" bordered={false}>
+      <div className="section-title-row">
+        <Typography.Title level={4} className="section-block-title">ECS 实例</Typography.Title>
+        <Button size="small" icon={<ReloadOutlined />} loading={ecsLoading} onClick={() => void loadEcsInstances()}>刷新</Button>
+      </div>
+      <Typography.Paragraph type="secondary">该账号下所有地域的 ECS 实例，共 {ecsInstances.length} 台</Typography.Paragraph>
+      <Table<EcsInstance>
+        className="modern-table"
+        rowKey="instanceId"
+        columns={ecsColumns}
+        dataSource={ecsInstances}
+        size="small"
+        loading={ecsLoading}
+        pagination={{ pageSize: 15, showSizeChanger: false }}
+        locale={{ emptyText: "暂无 ECS 实例" }}
+        tableLayout="fixed"
+      />
+    </Card>
+  );
+
   const aliyunPage = (
     <div className="workspace-stack">
       <div className="aliyun-feature-bar">
@@ -2535,6 +2640,7 @@ export default function App() {
       {aliyunFeature === "dns" && dnsPage}
       {aliyunFeature === "domain" && domainPage}
       {aliyunFeature === "ssl" && sslPage}
+      {aliyunFeature === "ecs" && ecsPage}
     </div>
   );
 

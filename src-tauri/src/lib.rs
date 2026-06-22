@@ -282,6 +282,25 @@ struct CasCertContent {
     message: Option<String>,
 }
 
+// ── ECS 实例 ──
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EcsInstance {
+    instance_id: String,
+    instance_name: Option<String>,
+    status: Option<String>,
+    region_id: String,
+    zone_id: Option<String>,
+    instance_type: Option<String>,
+    creation_time: Option<String>,
+    expired_time: Option<String>,
+    private_ip_address: Option<String>,
+    public_ip_address: Option<String>,
+    vpc_id: Option<String>,
+    tags: Option<String>,
+}
+
 #[derive(Debug)]
 struct ApiError {
     code: String,
@@ -903,6 +922,105 @@ async fn cas_create_free_cert(account: AccountInput, domain_name: String) -> Res
         .map_err(|err| err.to_string())?;
 
     Ok(response)
+}
+
+// ═══════════════════════════════════════════════════
+// ECS 实例管理
+// ═══════════════════════════════════════════════════
+
+#[tauri::command]
+async fn ecs_list_instances(account: AccountInput) -> Result<Vec<EcsInstance>, String> {
+    let client = AlibabaOpenApiClient::new()?;
+    let regions = describe_regions(&client, &account)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let mut all_instances = Vec::new();
+
+    for region_id in &regions {
+        let host = ecs_host(region_id);
+        let mut next_token: Option<String> = None;
+        loop {
+            let mut params = BTreeMap::new();
+            params.insert("RegionId".to_string(), region_id.to_string());
+            params.insert("MaxResults".to_string(), "100".to_string());
+            if let Some(token) = &next_token {
+                params.insert("NextToken".to_string(), token.clone());
+            }
+
+            let response = client
+                .call_rpc_json(&host, "DescribeInstances", ECS_VERSION, &account, &params)
+                .await
+                .map_err(|err| err.to_string())?;
+
+            let instances = response
+                .pointer("/Instances/Instance")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            for instance in instances {
+                let instance_id = instance
+                    .get("InstanceId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if instance_id.is_empty() {
+                    continue;
+                }
+
+                let tags = instance
+                    .pointer("/Tags/Tag")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|tag| {
+                                let key = tag.get("TagKey").and_then(Value::as_str)?;
+                                let value = tag.get("TagValue").and_then(Value::as_str)?;
+                                Some(format!("{}={}", key, value))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|s| !s.is_empty());
+
+                all_instances.push(EcsInstance {
+                    instance_id,
+                    instance_name: json_to_opt_string(instance.get("InstanceName")),
+                    status: json_to_opt_string(instance.get("Status")),
+                    region_id: region_id.clone(),
+                    zone_id: json_to_opt_string(instance.get("ZoneId")),
+                    instance_type: json_to_opt_string(instance.get("InstanceType")),
+                    creation_time: json_to_opt_string(instance.get("CreationTime")),
+                    expired_time: json_to_opt_string(instance.get("ExpiredTime")),
+                    private_ip_address: json_to_opt_string(instance.pointer("/VpcAttributes/PrivateIpAddress"))
+                        .or_else(|| json_to_opt_string(instance.get("PrivateIpAddress"))),
+                    public_ip_address: instance.pointer("/PublicIpAddress/IpAddress")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| json_to_opt_string(instance.get("PublicIpAddress"))),
+                    vpc_id: json_to_opt_string(instance.get("VpcId")),
+                    tags,
+                });
+            }
+
+            next_token = response
+                .get("NextToken")
+                .and_then(Value::as_str)
+                .map(String::from);
+            if next_token.is_none() {
+                break;
+            }
+        }
+    }
+
+    Ok(all_instances)
 }
 
 #[tauri::command]
@@ -2784,6 +2902,7 @@ pub fn run() {
             cas_list_orders,
             cas_get_cert,
             cas_create_free_cert,
+            ecs_list_instances,
             list_ssh_shortcuts,
             open_ssh_terminal,
             start_local_dev_services,
